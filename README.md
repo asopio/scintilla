@@ -84,6 +84,21 @@ In this sense, SCINTILLA is not just a converter and not just a retrieval tool.
 It is a systems repository for building scientific knowledge pipelines from raw
 PDF corpora to grounded LLM-assisted exploration.
 
+## Dependencies
+
+Key packages used by SCINTILLA:
+
+- **LangChain DeepAgents** — agent framework used for tool-driven language-model workflows  
+  https://reference.langchain.com/python/deepagents
+- **Vortex** — columnar data format used for retrieval-oriented database storage  
+  https://vortex.dev/
+- **DuckDB** — analytical SQL database interface relevant for structured querying over stored data  
+  https://duckdb.org/
+- **DjVu** — document/image format used in the repository for compact page-image storage  
+  https://en.wikipedia.org/wiki/DjVu
+
+Additional dependencies:  OpenAI-compatible clients, LangChain components, Chroma, MarkItDown, PDF tooling (Poppler, QPDF), training/evaluation utilities in huggingface transformers for fine-tuning and serving LLMs.
+
 ## License 
 
 MIT
