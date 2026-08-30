@@ -1,0 +1,18 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+# input/output
+output*
+# reference repos
+docling
+# worktrees
+worktrees
+__pycache__
+test_outputs
+# dependencies
+calibre
+# local datasets and logs
+downloads/
+*.out
+trackio
+paper_latex_source

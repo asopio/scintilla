@@ -1,0 +1,24 @@
+p {
+  text-align: justify;
+}
+
+.pagebreak {
+  height: 0;
+  margin: 2rem 0;
+  border: 0;
+}
+
+@media screen {
+  .pagebreak {
+    border-top: 1px solid #d0d0d0;
+  }
+}
+
+@media print {
+  .pagebreak {
+    break-before: page;
+    page-break-before: always;
+    border-top: none;
+    margin: 0;
+  }
+}

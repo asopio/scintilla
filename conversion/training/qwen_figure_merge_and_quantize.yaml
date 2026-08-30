@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: asopio-qwen-figure-merge-quantize-
+  labels:
+    eidf/user: asopio-eidf107
+    kueue.x-k8s.io/queue-name: eidf107ns-user-queue
+spec:
+  imagePullSecrets:
+    - name: ghcr-ldc
+  containers:
+    - name: qwen-figure-merge-quantize
+      image: ghcr.io/asopio/llm-doc-converter/qwen-figure-finetune:sha-5a2ae2b
+      volumeMounts:
+        - name: model-training-storage
+          mountPath: /mnt/persistent-storage/
+      env:
+        - name: HF_HOME
+          value: /mnt/persistent-storage/hf_home
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/compat/lib.real
+        - name: BASE_MODEL
+          value: Qwen/Qwen3.6-35B-A3B
+        - name: ADAPTER_DIR
+          value: /mnt/persistent-storage/training/runs/qwen-figure-detector-v1/adapter
+        - name: MERGED_MODEL_DIR
+          value: /mnt/persistent-storage/training/merged/qwen-figure-detector-v1
+        - name: CALIB_VORTEX_FILE
+          value: /mnt/persistent-storage/arxiv_hep_ex.vortex
+        - name: QUANTIZED_MODEL_DIR
+          value: /mnt/persistent-storage/training/quantized/qwen-figure-detector-v1-nvfp4
+        - name: QFORMAT
+          value: nvfp4_experts_only
+        - name: KV_CACHE_QFORMAT
+          value: fp8_cast
+        - name: CALIB_SIZE
+          value: "256"
+        - name: BATCH_SIZE
+          value: "1"
+        - name: MAX_LENGTH
+          value: "512"
+        - name: MAX_IMAGE_SIZE
+          value: "512"
+      command:
+        - /bin/bash
+        - -lc
+        - |
+          set -euo pipefail
+          nvidia-smi
+          pixi run -m /opt/llm-doc-converter/training/pixi.toml \
+            python /opt/llm-doc-converter/training/merge_qwen_figure_adapter.py \
+            --base-model "$BASE_MODEL" \
+            --adapter-dir "$ADAPTER_DIR" \
+            --output-dir "$MERGED_MODEL_DIR"
+          pixi run -m /opt/llm-doc-converter/training/pixi.toml \
+            python /opt/llm-doc-converter/training/quantize_qwen_figure_detector.py \
+            --merged-model-dir "$MERGED_MODEL_DIR" \
+            --export-dir "$QUANTIZED_MODEL_DIR" \
+            --calib-vortex-file "$CALIB_VORTEX_FILE" \
+            --qformat "$QFORMAT" \
+            --kv-cache-qformat "$KV_CACHE_QFORMAT" \
+            --calib-size "$CALIB_SIZE" \
+            --batch-size "$BATCH_SIZE" \
+            --max-length "$MAX_LENGTH" \
+            --max-image-size "$MAX_IMAGE_SIZE"
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          cpu: 16
+          memory: 256Gi
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+  volumes:
+    - name: model-training-storage
+      persistentVolumeClaim:
+        claimName: model-training-storage
+  restartPolicy: Never

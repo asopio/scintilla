@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: asopio-qwen-figure-finetune-
+  labels:
+    eidf/user: asopio-eidf107
+    kueue.x-k8s.io/queue-name: eidf107ns-user-queue
+spec:
+  imagePullSecrets:
+    - name: ghcr-ldc
+  containers:
+    - name: qwen-figure-finetune
+      image: ghcr.io/asopio/llm-doc-converter/qwen-figure-finetune:sha-5a2ae2b
+      volumeMounts:
+        - name: model-training-storage
+          mountPath: /mnt/persistent-storage/
+      env:
+        - name: HF_HOME
+          value: /mnt/persistent-storage/hf_home
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/compat/lib.real
+      command:
+        - /bin/bash
+        - -lc
+        - |
+          nvidia-smi && \
+          ls /mnt/persistent-storage && \
+          pixi run -m /opt/llm-doc-converter/training/pixi.toml \
+            python /opt/llm-doc-converter/training/train_qwen_figure_detector.py \
+            --vortex-file /mnt/persistent-storage/arxiv_hep_ex.vortex \
+            --val-vortex-file /mnt/persistent-storage/arxiv_hep_ph.vortex \
+            --output-dir /mnt/persistent-storage/training/runs/qwen-figure-detector-v1 \
+            --model Qwen/Qwen3.6-35B-A3B \
+            --epochs 2 \
+            --per-device-train-batch-size 1 \
+            --per-device-eval-batch-size 1 \
+            --gradient-accumulation-steps 16 \
+            --learning-rate 2e-4 \
+            --warmup-ratio 0.03 \
+            --weight-decay 0.0 \
+            --max-length 512 \
+            --max-image-size 512 \
+            --val-ratio 0.1 \
+            --use-qlora \
+            --gradient-checkpointing \
+            --lora-r 4 \
+            --lora-alpha 8 \
+            --lora-dropout 0.05 \
+            --lora-target-modules q_proj,k_proj,v_proj,o_proj,linear_attn.in_proj_qkv \
+            --trackio-project qwen-figure-detector-v1 
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          cpu: 16
+          memory: 256Gi
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+  volumes:
+    - name: model-training-storage
+      persistentVolumeClaim:
+        claimName: model-training-storage
+  restartPolicy: Never

@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: asopio-qwen-figure-finetune-eval-
+  labels:
+    eidf/user: asopio-eidf107
+    kueue.x-k8s.io/queue-name: eidf107ns-user-queue
+spec:
+  imagePullSecrets:
+    - name: ghcr-ldc
+  containers:
+    - name: qwen-figure-finetune-eval
+      image: ghcr.io/asopio/llm-doc-converter/qwen-figure-finetune:sha-286d60c
+      volumeMounts:
+        - name: model-training-storage
+          mountPath: /mnt/persistent-storage/
+      env:
+        - name: HF_HOME
+          value: /mnt/persistent-storage/hf_home
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: expandable_segments:True
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/compat/lib.real
+        - name: NUM_GPUS
+          value: "2"
+        - name: BASE_MODEL
+          value: Qwen/Qwen3.6-35B-A3B
+        - name: ADAPTER_DIR
+          value: /mnt/persistent-storage/training/runs/qwen-figure-detector-v1/adapter
+        - name: VORTEX_FILE
+          value: /mnt/persistent-storage/arxiv_hep_ph.vortex
+        - name: OUTPUT_DIR
+          value: /mnt/persistent-storage/training/eval/qwen-figure-detector-v1
+        - name: MAX_LENGTH
+          value: "512"
+        - name: MAX_IMAGE_SIZE
+          value: "512"
+        - name: BATCH_SIZE
+          value: "1"
+        - name: MAX_NEW_TOKENS
+          value: "256"
+      command:
+        - /bin/bash
+        - -lc
+        - |
+          set -euo pipefail
+          nvidia-smi
+          pixi run -m /opt/llm-doc-converter/training/pixi.toml \
+            python /opt/llm-doc-converter/training/eval_qwen_figure_detector.py \
+            --base-model "$BASE_MODEL" \
+            --adapter-dir "$ADAPTER_DIR" \
+            --vortex-file "$VORTEX_FILE" \
+            --output-dir "$OUTPUT_DIR" \
+            --num-gpus "$NUM_GPUS" \
+            --max-length "$MAX_LENGTH" \
+            --max-image-size "$MAX_IMAGE_SIZE" \
+            --batch-size "$BATCH_SIZE" \
+            --max-new-tokens "$MAX_NEW_TOKENS"
+      resources:
+        limits:
+          nvidia.com/gpu: 2
+          cpu: 16
+          memory: 256Gi
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+  volumes:
+    - name: model-training-storage
+      persistentVolumeClaim:
+        claimName: model-training-storage
+  restartPolicy: Never

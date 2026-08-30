@@ -1,0 +1,43 @@
+[workspace]
+authors = ["Alex Sopio <alexander.linus.sopio@cern.ch>"]
+channels = ["conda-forge"]
+name = "thesis_cheng"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks.build_calibre]
+cmd = "cd calibre; ./setup.py build_dep linux"
+
+[tasks.convert-to-html]
+cmd = "python -m markdown_to_book"
+
+[tasks.convert-to-html-example]
+cmd = "python -m markdown_to_book test_outputs/cheng_jiang_full_revised_thesis_v12.md -o output_html"
+
+[activation]
+scripts = ["activation/set_hf_home.sh"]
+
+[activation.env]
+BYPY_LOCATION = "calibre/bypy/linux"
+PODOFO_INC_DIR = ".pixi/envs/default/include"
+PODOFO_LIB_DIR = ".pixi/envs/default/lib"
+
+[dependencies]
+poppler = ">=26.7.0,<27"
+python = "==3.14"
+pkg-config = ">=0.29.2,<0.30"
+qt = ">=5.15.15,<6"
+podofo = ">=0.9.8,<0.10"
+pandoc = ">=3.10.1,<4"
+qpdf = ">=12.3.2,<13"
+pnpm = ">=12.0.0,<13"
+
+[pypi-dependencies]
+langchain = ">=1.3.14, <2"
+langchain-openai = ">=1.3.5, <2"
+docling = ">=2.113.0, <3"
+transformers = ">=5.14.1, <6"
+markdown = ">=3.10.2, <4"
+deepagents = ">=0.6.12, <0.7"
+pillow = "==12.3.0"
+markdown-it-py = { version = ">=4.2.0, <5", extras = ["linkify", "plugins"] }
