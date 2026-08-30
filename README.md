@@ -1,4 +1,4 @@
-# SCINTILLA
+# ✨ SCINTILLA 💫
 
 ## Scientific Corpus Intelligence and Navigation Toolkit using Large-Language-model Agents
 
