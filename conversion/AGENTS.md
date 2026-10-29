@@ -1,4 +1,4 @@
-# AGENTS.md — LLM Doc Converter
+# AGENTS.md — LLM (large language model) Doc Converter
 
 ## Project Overview
 
@@ -133,6 +133,46 @@ The review loop lives inside `pdf_to_markdown_agentic.py` and uses a DeepAgents 
 
 The standalone helper `run_review.py` is currently a hard-coded convenience script for one test output, not a general CLI.
 
+## DeepSeek-OCR2 (optical character recognition) PDF → Markdown pipeline
+
+Second converter, for scanned/slide documents. It sends one rendered page image per request to DeepSeek-OCR-2 served by vLLM (pod spec: `vllm_deepseek_ocr2.yaml` at the repo root), keeps the model's grounding/layout tokens in a raw dump, crops the figure det boxes, and finishes with `dsocr2_postprocess.py`.
+
+### Primary entrypoint
+
+```bash
+pixi run python pdf_to_markdown_dsocr2.py input.pdf
+pixi run python pdf_to_markdown_dsocr2.py input.pdf -o out/ --dpi 150 --start-page 0 --end-page 10
+```
+
+### What the pipeline does
+
+1. Uses `pdfinfo` to count pages.
+2. Renders requested pages to `pages/page-NN.png` with `pdftoppm` (parallel, cached; `--force` re-renders).
+3. One chat completion per page image: prompt `<|grounding|>Convert the document to markdown.`, temperature 0, max_tokens 8180, `skip_special_tokens=false` (keeps the layout tokens).
+4. Writes the raw grounding dump `<stem>_dsocr2.md` with a preamble, `Page notes:` (blank scans) and `<!-- ==================== PAGE N ==================== -->` markers — same format as `Evian1992LHC_sample_dsocr2.md`.
+5. Crops each `<|ref|>image<|/ref|><|det|>` box (normalized 0–999 of the page image) from the rendered page into `figures/page-NN-fKK.png` and records `figures_manifest.json` (schema of `example_docs/evian/figures_manifest.json`, `rotated_input` always false).
+6. Calls `dsocr2_postprocess.postprocess()` to write the standard markdown to `md/<stem>_dsocr2.md` (`## Slide N`, `---` separators, pipe tables, `$…$`/`$$…$$` math, `![Figure k](../figures/…)` refs).
+
+Raw per-page model outputs are cached in `raw_pages/page-NN.txt`, so interrupted runs resume without re-OCRed pages. Pages are sent in their native orientation — rotated pages are NOT handled.
+
+### Supported options
+
+- `-o, --output` — output directory (default: the PDF's directory, as in `example_docs/evian/`)
+- `--dpi` — page render DPI, default `150`
+- `--llm-base-url` — default `http://127.0.0.1:8000/v1` (the dsocr2 pod — not the Qwen `:8008` endpoint)
+- `--model` — default `deepseek-ocr2`
+- `--api-key` — default `EMPTY`
+- `--temperature` (default `0`), `--max-tokens` (default `8180`), `--request-timeout` (default `600`)
+- `--start-page` / `--end-page` — same 0-indexed semantics as the main pipeline
+- `--npages-parallel` — rendering + OCR parallelism, default `8`
+- `--force` — re-render/re-OCR cached pages
+- `--continue-on-error` — skip pages whose request fails
+- `--skip-figures` — no crops, empty manifest
+- `--no-postprocess` — stop after raw dump + figures
+- `--no-cache-dir` — remove rendered page PNGs after completion
+
+`dsocr2_postprocess.py` also works standalone (`python3 dsocr2_postprocess.py [input.md] [-o OUT] [--figures-dir DIR] [--manifest FILE]`; no-args defaults re-process the Evian sample) and is stdlib-only.
+
 ## Markdown → HTML / EPUB pipeline
 
 The `markdown_to_book/` package turns generated Markdown into standalone HTML or EPUB via preprocessing plus pandoc.
@@ -190,6 +230,8 @@ pixi run convert-to-html -- test_outputs/file.md -o output_html/
 
 ```text
 pdf_to_markdown_agentic.py   Main PDF → Markdown pipeline
+pdf_to_markdown_dsocr2.py    DeepSeek-OCR2 (vLLM) grounding pipeline
+dsocr2_postprocess.py        Raw-dump post-processor (slides, tables, math, figures)
 pdf_to_markdown.py           Older simpler converter without agentic review/figure workflow
 markdown_to_book/            Markdown preprocessing + pandoc conversion package
 run_review.py                Hard-coded review helper for a sample output

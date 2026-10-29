@@ -47,16 +47,36 @@ class Placement:
     source_stream_object: str
 
 
+def _run_qpdf_capture(cmd: list[str]) -> tuple[bytes, str]:
+    """Run a qpdf command, returning ``(stdout_bytes, stderr_text)``.
+
+    qpdf's exit status is a bitmask (1 = warning, 2 = error) and it can
+    finish non-zero while still producing complete, valid output — e.g. an
+    old PDF with an inconsistent object table reports
+    "operation succeeded with warnings" yet exits 3.  Callers validate the
+    output itself instead of relying on the exit code.
+    """
+    result = subprocess.run(cmd, capture_output=True)
+    return result.stdout, result.stderr.decode("utf-8", "replace").strip()
+
+
 def run_qpdf_json(pdf_path: str) -> dict[str, Any]:
-    result = subprocess.run(["qpdf", "--json", pdf_path], check=True, capture_output=True, text=True)
-    return json.loads(result.stdout)
+    stdout, stderr = _run_qpdf_capture(["qpdf", "--json", pdf_path])
+    try:
+        return json.loads(stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"qpdf --json produced no valid JSON for {pdf_path}: {error}; qpdf: {stderr}"
+        ) from error
 
 
 def run_qpdf_qdf(pdf_path: str) -> str:
-    result = subprocess.run(
-        ["qpdf", "--qdf", "--object-streams=disable", pdf_path, "-"], check=True, capture_output=True
+    stdout, stderr = _run_qpdf_capture(
+        ["qpdf", "--qdf", "--object-streams=disable", pdf_path, "-"]
     )
-    return result.stdout.decode("latin1", errors="ignore")
+    if not stdout.startswith(b"%PDF"):
+        raise RuntimeError(f"qpdf --qdf produced no QDF output for {pdf_path}; qpdf: {stderr}")
+    return stdout.decode("latin1", errors="ignore")
 
 
 def parse_objects(qdf_text: str) -> dict[str, str]:
@@ -250,11 +270,15 @@ def render_pdf_page(pdf_path: str, output_prefix: str, dpi: int, page_num_1index
 
 
 def extract_single_page_pdf(src_pdf: str, page_num_1indexed: int, output_pdf: str) -> None:
-    subprocess.run(
-        ["qpdf", src_pdf, "--pages", src_pdf, str(page_num_1indexed), "--", output_pdf],
-        check=True,
-        capture_output=True,
+    _stdout, stderr = _run_qpdf_capture(
+        ["qpdf", src_pdf, "--pages", src_pdf, str(page_num_1indexed), "--", output_pdf]
     )
+    out = Path(output_pdf)
+    if not out.is_file() or not out.read_bytes().startswith(b"%PDF"):
+        raise RuntimeError(
+            f"qpdf page extraction produced no PDF for {src_pdf} page {page_num_1indexed}; "
+            f"qpdf: {stderr}"
+        )
 
 
 def analyze_single_page_pdf(page_pdf_path: str, physical_page_num: int, page_label: Any, debug: bool) -> dict[str, Any]:

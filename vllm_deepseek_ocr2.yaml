@@ -1,0 +1,182 @@
+# vLLM serving for DeepSeek-OCR-2 (deepseek-ai/DeepSeek-OCR-2)
+#
+# Follows the official serving instructions at
+#   https://github.com/deepseek-ai/DeepSeek-OCR-2/
+# and mirrors the reference LLM() config in
+#   DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/run_dpsk_ocr2_pdf.py :
+#
+#   * image pinned to vLLM 0.8.5 -- the released `deepseek_ocr2.py`
+#     model implementation targets the 0.8.5 vLLM API and the V0
+#     engine. Do NOT bump to `latest` (V1 engine) without re-validating.
+#   * the image ships torch 2.6.0+cu124 but NO flash-attn, and the
+#     model code hard-imports it (deepencoderv2/sam_vary_sdpa.py);
+#     `addict` is also imported by deepseek_ocr2.py. Both are
+#     installed once at pod start (see command):
+#       - flash-attn 2.7.3 (the version pinned in the DeepSeek README).
+#         2.8.x is NOT ABI-compatible with torch 2.6.0 and fails at
+#         import with "undefined symbol: _ZN3c105ErrorC2E...".
+#       - the prebuilt cu12/torch2.6/cxx11abiFALSE wheel is used to
+#         avoid a 30-60 min source compile; pip cache lives on the PVC.
+#   * custom model code is not in any vLLM registry, so on first start
+#     the pod clones the DeepSeek-OCR-2 repo onto the PVC and a small
+#     wrapper registers DeepseekOCR2ForCausalLM before invoking the
+#     `vllm` CLI (vllm.entrypoints.cli.main, same as the console script).
+#     --disable-frontend-multiprocessing is mandatory: the engine must
+#     run in the same process as that registration (a spawned engine
+#     process has an empty registry and would fall back to the HF
+#     transformers file, which needs matplotlib and is not vLLM-native).
+#   * model weights are pulled from HF into the same PVC as the Qwen
+#     pods (HF_HOME), ~8 GB one-time download; pre-stage both repo and
+#     weights on the PVC if the cluster has no github.com egress.
+#
+# Client notes (e.g. for conversion/pdf_to_markdown_agentic.py):
+#   * model name:      deepseek-ocr2   (see --served-model-name)
+#   * grounding prompt: <|grounding|>Convert the document to markdown.
+#     Send ONE page image per request; the server builds the 1024^2
+#     global view + up to six 768^2 crop tiles internally.
+#   * chat template: the tokenizer defines no chat template, so vLLM
+#     rejects chat requests unless one is passed IN THE REQUEST BODY:
+#       "chat_template": "<|begin▁of▁sentence|>{% for message in messages %}{{ message['content'] }}{% endfor %}",
+#       "add_generation_prompt": false
+#     and the image content part must come BEFORE the text part, so the
+#     rendered prompt is the reference "<image>\n<|grounding|>Convert
+#     the document to markdown." (see
+#     conversion/pdf_to_markdown_dsocr2.py and
+#     /tmp/opencode/dsocr2_test/ocr_page.py).
+#   * decode params:   temperature=0, max_tokens=8192,
+#     skip_special_tokens=false  (keeps the layout tokens in the output)
+#   * layout output:   figures/titles are inline markdown tags
+#     <|ref|>image<|/ref|><|det|>[[x1,y1,x2,y2],...]<|/det|>
+#     (coords normalized 0-999 of the input page image)
+#   * note: the reference's NoRepeatNGramLogitsProcessor is a client
+#     (offline-engine) feature; on the OpenAI server apply equivalent
+#     repetition handling post-hoc if tables repeat.
+#
+# KEEPALIVE WARNING (idle-GPU reaper):
+#   A cluster script watches GPU utilization and, on a check ~50 min after
+#   pod start, rewrites spec.activeDeadlineSeconds down so the pod is
+#   terminated ~56 min after start (observed: 432000 -> 3377 / 2837 / 3368
+#   on three pods; the deadline is counted from pod.startTime, so the pod
+#   dies exactly startTime + rewritten value).  Checks repeat afterwards.
+#   What does NOT survive: text-only API pings (GPU ~0%), and even real
+#   page-image OCRs at low frequency -- one page every 2 min averaged only
+#   ~0.12% GPU duty (39.7 GPU-s in 54 min) and the reaper still fired.
+#   Current keepalive: cycle the 7 densest page images (each ~16 s of GPU
+#   work) back-to-back for 180 s, sleep 60 s, repeat => ~75% duty:
+#     /tmp/opencode/dsocr2_test/gpu_keepalive.sh   # [busy_seconds] [idle_seconds]
+#   Verify with: kubectl get pod <pod> -o jsonpath='{.spec.activeDeadlineSeconds}'
+#   (must still read 432000 ~56 min after start, and afterwards).
+#   Note: the pod spec also gets enriched at admission (hostname pinning,
+#   general_node selector, eidf107 taint toleration, requests=limits)
+#   -- that is normal platform behavior, not the reaper.
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: asopio-eidf107-vllm-dsocr2-h100-
+  labels:
+    eidf/user: asopio-eidf107
+    app: asopio-vllm-dsocr2
+    kueue.x-k8s.io/queue-name: eidf107ns-user-queue
+spec:
+  activeDeadlineSeconds: 432000
+  containers:
+    - name: vllm-dsocr2
+      # Pinned to the vLLM version the reference implementation targets.
+      # v0.8.5.post1 (patch) is also available on Docker Hub.
+      image: vllm/vllm-openai:v0.8.5
+      env:
+        - name: HF_HOME
+          value: /mnt/persistent-storage/hf_home
+        - name: HF_HUB_DISABLE_PROGRESS_BARS
+          value: "1"
+        # Reference scripts (run_dpsk_ocr2_*.py) force the V0 engine;
+        # the custom model code is only validated against it.
+        - name: VLLM_USE_V1
+          value: "0"
+      command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+
+          # --- One-time dependency setup (not shipped in the vLLM image) ---
+          # Cache pip (incl. the ~191 MB flash-attn wheel) on the PVC so a
+          # recreated pod skips the download.
+          export PIP_CACHE_DIR=/mnt/persistent-storage/pip-cache
+
+          # `addict` is imported at module load by deepseek_ocr2.py.
+          python3 -c "import addict" 2>/dev/null || python3 -m pip install --quiet addict
+
+          # flash-attn: the model code imports `flash_attn_qkvpacked_func`.
+          # Install the PREBUILT 2.7.3 wheel matching this image
+          # (torch 2.6.0 + cu124 + python 3.12, legacy cxx11 ABI) -- this is
+          # the version the DeepSeek-OCR-2 README pins. Do NOT run a bare
+          # `pip install flash-attn`: it fetches 2.8.x from source, which is
+          # ABI-incompatible with torch 2.6.0 and fails at import with
+          # "undefined symbol: _ZN3c105ErrorC2E...".
+          if ! python3 -c "from flash_attn import flash_attn_qkvpacked_func" 2>/dev/null; then
+            python3 -m pip install --quiet \
+              "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+          fi
+
+          # One-time: fetch the custom model code onto the PVC.
+          REPO=/mnt/persistent-storage/deepseek-ocr2/DeepSeek-OCR-2
+          if [ ! -d "$REPO/DeepSeek-OCR2-master" ]; then
+            git clone --depth 1 https://github.com/deepseek-ai/DeepSeek-OCR-2.git "$REPO"
+          fi
+          cd "$REPO/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm"
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
+          # Register the custom architecture, then hand off to the vllm
+          # CLI (equivalent to the `vllm` console script in 0.8.5).
+          #
+          # NOTE: --disable-frontend-multiprocessing is REQUIRED. `vllm
+          # serve` otherwise spawns the engine in a child process with a
+          # fresh model registry, so the registration above is invisible
+          # there and vLLM falls back to the HF transformers modeling
+          # file (which fails on `import matplotlib` and is not the
+          # vLLM-native implementation). With the flag, the engine runs
+          # in this process, next to the registration.
+          exec python3 -c '
+          import sys
+          from vllm.model_executor.models.registry import ModelRegistry
+          from deepseek_ocr2 import DeepseekOCR2ForCausalLM
+          ModelRegistry.register_model("DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM)
+          from vllm.entrypoints.cli.main import main
+          sys.argv = ["vllm"] + sys.argv[1:]
+          main()
+          ' serve deepseek-ai/DeepSeek-OCR-2 \
+            --served-model-name deepseek-ocr2 \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --trust-remote-code \
+            --hf-overrides '{"architectures":["DeepseekOCR2ForCausalLM"]}' \
+            --dtype bfloat16 \
+            --tensor-parallel-size 1 \
+            --max-model-len 8192 \
+            --block-size 128 \
+            --gpu-memory-utilization 0.9 \
+            --swap-space 0 \
+            --max-num-seqs 64 \
+            --max-num-batched-tokens 8192 \
+            --disable-mm-preprocessor-cache \
+            --disable-frontend-multiprocessing \
+            --disable-log-requests
+      ports:
+        - containerPort: 8000
+      volumeMounts:
+        - name: model-storage
+          mountPath: /mnt/persistent-storage/
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          cpu: 16
+          memory: 64Gi
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+    # nvidia.com/gpu.product: NVIDIA-H200
+  volumes:
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: asopio-eidf107-ws1
+  restartPolicy: Never

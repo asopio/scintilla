@@ -1,0 +1,26 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# testing-set data (regenerate with example_docs/testing_set/run_eval_benchmark.sh
+# and evaluation/html_to_markdown.py; too large for git)
+example_docs/testing_set/pdf/
+example_docs/testing_set/html/
+example_docs/testing_set/md/
+example_docs/testing_set/eval_md/
+
+# other experiment data / reference material
+example_docs/evian/
+example_docs/evian_complete/
+example_docs/Evian1992LHC.pdf
+Evian1992LHC_sample_dsocr2.md
+DeepSeek_OCR2_paper.pdf
+DeepSeek_OCR2_paper.txt
+
+# logs / traces
+*.log
+sessiontrace_ocr.txt

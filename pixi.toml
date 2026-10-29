@@ -1,0 +1,20 @@
+[workspace]
+authors = ["Alex Sopio <alexander.linus.sopio@cern.ch>"]
+channels = ["conda-forge"]
+name = "scintilla"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+poppler = ">=26.9.0,<27"
+python = ">=3.15,<3.16"
+
+[pypi-dependencies]
+# BLEU is computed with nltk.translate.bleu_score; ROUGE-1/2/L is implemented
+# in evaluation/benchmark_similarity.py (nltk has no ROUGE module in any
+# modern release).
+nltk = ">=3.10.4,<4"
+# ranking chart output of evaluation/benchmark_similarity.py
+matplotlib = ">=3.10,<4"

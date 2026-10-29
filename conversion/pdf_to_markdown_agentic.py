@@ -908,7 +908,7 @@ def create_parser():
                         help="Output directory (default: same dir as PDF)")
     parser.add_argument("--dpi", type=int, default=300,
                         help="DPI for page images (default: 300)")
-    parser.add_argument("--model", default="nvidia/Qwen3.6-35B-A3B-NVFP4",
+    parser.add_argument("--model", default="Qwen/Qwen3.8-27B-FP8",
                         help="OpenAI-compatible model name")
     parser.add_argument("--api-key", default="EMPTY",
                         help="OpenAI API key (or set OPENAI_API_KEY env var)")

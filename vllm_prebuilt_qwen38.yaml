@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: asopio-eidf107-vllm-qwen38-27b-fp8-h200-
+  labels:
+    eidf/user: asopio-eidf107
+    app: asopio-vllm-qwen38
+    kueue.x-k8s.io/queue-name: eidf107ns-user-queue
+spec:
+  activeDeadlineSeconds: 432000
+  containers:
+    - name: vllm-prebuilt
+      image: vllm/vllm-openai:latest
+      env:
+        - name: HF_HOME
+          value: /mnt/persistent-storage/hf_home
+        - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+          value: "1"
+      command:
+        - vllm
+        - serve
+        - Qwen/Qwen3.8-27B-FP8
+        - --hf-overrides
+        - '{"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":4.0,"original_max_position_embeddings":262144}}}'
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        - --tensor-parallel-size
+        - "1"
+        - --trust-remote-code
+        - --kv-cache-dtype
+        - fp8
+        - --attention-backend
+        - flashinfer
+        - --moe-backend
+        - marlin
+        - --gpu-memory-utilization
+        - "0.9"
+        - --max-model-len
+        - "1000000"
+        - --max-num-seqs
+        - "64"
+        - --max-num-batched-tokens
+        - "8192"
+        - --enable-chunked-prefill
+        - --async-scheduling
+        - --enable-prefix-caching
+        - --speculative-config
+        - '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
+        - --load-format
+        - fastsafetensors
+        - --reasoning-parser
+        - qwen3
+        - --tool-call-parser
+        - qwen3_xml
+        - --enable-auto-tool-choice
+      ports:
+        - containerPort: 8000
+      volumeMounts:
+        - name: model-storage
+          mountPath: /mnt/persistent-storage/
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          cpu: 32
+          memory: 128Gi
+  nodeSelector:
+    # nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+    nvidia.com/gpu.product: NVIDIA-H200
+  volumes:
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: asopio-eidf107-ws1
+  restartPolicy: Never
