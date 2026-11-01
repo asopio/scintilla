@@ -12,13 +12,15 @@ following the workflow of ``pdf_md_convert_vlm_fast.py``:
     ``figures/`` plus a per-page manifest entry in
     ``raw_pages/figures_page-NN.json``.
   * as soon as a page's OCR completes, a figure-description job (same
-    pool) sends the whole rendered page image plus the page's OCR text
-    to Qwen3.8, which returns one concise description per figure block
-    in a fixed JSON schema (``desc_figure_1``, ``desc_figure_2``, ...);
-    the values are cached in the per-page manifest (a ``"description"``
-    field on each entry).  ``--skip-figure-descriptions`` opts out.  A
-    page whose description fails (one corrective retry on unparseable
-    JSON) warns and continues with undescribed figures.
+    pool by default; ``--description-workers N`` with N > 0 gives them
+    a dedicated N-thread pool so they never queue behind OCR) sends
+    the whole rendered page image plus the page's OCR text to Qwen3.8,
+    which returns one concise description per figure block in a fixed
+    JSON schema (``desc_figure_1``, ``desc_figure_2``, ...); the values
+    are cached in the per-page manifest (a ``"description"`` field on
+    each entry).  ``--skip-figure-descriptions`` opts out.  A page
+    whose description fails (one corrective retry on unparseable JSON)
+    warns and continues with undescribed figures.
   * a small dedicated set of collation workers runs in parallel with
     the pool (``--collation-workers``, default ``workers//16 + 1``;
     the OCR page pool gets ``workers - collation-workers`` threads).
@@ -96,6 +98,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import queue
@@ -1002,6 +1005,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--collation-workers", type=int, default=None,
                    help="dedicated collation + review threads (default: "
                         "workers//16 + 1; the rest of --workers do OCR)")
+    p.add_argument("--description-workers", type=int, default=0,
+                   help="dedicated thread pool for figure-description "
+                        "jobs, so they never queue behind OCR (default: "
+                        "0 = share the OCR page pool)")
     p.add_argument("--dpi", type=int, default=150,
                    help="page render DPI (default: %(default)s)")
     p.add_argument("--start-page", type=int, default=0,
@@ -1181,6 +1188,12 @@ def main(argv: list[str] | None = None) -> int:
               f"{collation_workers}; raise --workers or lower "
               f"--collation-workers", file=sys.stderr)
         return 1
+    description_workers = args.description_workers
+    if description_workers < 0:
+        print("error: --description-workers must be >= 0 (0 = share the "
+              "OCR page pool with the figure-description jobs)",
+              file=sys.stderr)
+        return 1
 
     # ---- discover documents ----------------------------------------------
     if args.pdfs:
@@ -1336,7 +1349,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- banner -------------------------------------------------------------
     t_start = time.time()
-    pool_workers = max(1, min(page_workers, len(jobs) + len(desc_jobs) or 1))
+    # The OCR page pool hosts the description jobs too unless
+    # --description-workers gives them a separate pool of their own.
+    if description_workers:
+        pool_workers = max(1, min(page_workers, len(jobs) or 1))
+    else:
+        pool_workers = max(1, min(page_workers, len(jobs) + len(desc_jobs)
+                                  or 1))
     n_collators = (0 if (args.dry_run or not doc_states)
                    else min(collation_workers, len(doc_states)))
     print(f"DSOCR2 + Qwen3.8 batch workflow: {len(documents)} document(s), "
@@ -1347,12 +1366,14 @@ def main(argv: list[str] | None = None) -> int:
               f"{pool_workers} parallel pdftoppm workers "
               f"(no OCR, no collation)")
     else:
+        desc_note = (f" + {description_workers} dedicated description "
+                     f"thread(s)" if description_workers else "")
         print(f"Page pool: {len(jobs)} OCR job(s) + {len(desc_jobs)} "
               f"figure-description job(s) with up to {pool_workers} "
-              f"threads -> {args.dsocr2_base_url} ({args.dsocr2_model}) / "
-              f"{args.qwen_base_url} ({args.qwen_model}); "
-              f"{n_collators} collation thread(s) for "
-              f"{len(doc_states)} document(s)")
+              f"threads{desc_note} -> {args.dsocr2_base_url} "
+              f"({args.dsocr2_model}) / {args.qwen_base_url} "
+              f"({args.qwen_model}); {n_collators} collation thread(s) "
+              f"for {len(doc_states)} document(s)")
 
     # ---- collation workers (run in parallel with the page pool) ----------
     requests: queue.Queue = queue.Queue()
@@ -1403,8 +1424,18 @@ def main(argv: list[str] | None = None) -> int:
     stopping = False
 
     if jobs or desc_jobs:
-        with ThreadPoolExecutor(max_workers=pool_workers,
-                                 thread_name_prefix="page") as pool:
+        with contextlib.ExitStack() as stack:
+            page_pool = stack.enter_context(
+                ThreadPoolExecutor(max_workers=pool_workers,
+                                   thread_name_prefix="page"))
+            # Figure-description jobs either share the OCR pool (default)
+            # or run in a dedicated --description-workers pool so they
+            # never queue behind OCR work.  Both pools feed the same
+            # completion queue below.
+            desc_pool = (stack.enter_context(
+                ThreadPoolExecutor(max_workers=description_workers,
+                                   thread_name_prefix="desc"))
+                if description_workers else None)
             # A page job that succeeds can spawn a figure-description
             # job, so a static as_completed over the initial batch could
             # never see the later futures.  Instead every submitted
@@ -1416,7 +1447,10 @@ def main(argv: list[str] | None = None) -> int:
 
             def track(kind: str, state: DocState | None, job, fn) -> None:
                 nonlocal outstanding
-                fut = pool.submit(fn, job)
+                pool_ = (desc_pool
+                         if (kind == "desc" and description_workers)
+                         else page_pool)
+                fut = pool_.submit(fn, job)
                 futures[fut] = (kind, state, job)
                 outstanding += 1
 
@@ -1550,10 +1584,10 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed = time.time() - t_start
                     print(f"Progress: {pages_done}/{len(jobs)} pages "
                           f"({pages_ok} ok, {pages_failed} failed, "
-                          f"{placeholders} placeholders), "
-                          f"avg {elapsed / max(pages_done, 1):.2f}s/page, "
-                          f"{handed}/{len(doc_states)} document(s) "
-                          f"handed off")
+                              f"{placeholders} placeholders), "
+                              f"avg {elapsed / max(pages_done, 1):.2f}s/page, "
+                              f"{handed}/{len(doc_states)} document(s) "
+                              f"handed off")
 
     # ---- drain the collation workers ---------------------------------------
     doc_results: list[tuple[str, str, str]] = []

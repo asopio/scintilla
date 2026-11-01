@@ -207,12 +207,14 @@ In `pdf_to_markdown_dsocr2_qwen_fast.py`, as soon as a page's OCR completes, a f
 - A document is handed to the collation workers only once all of its pages are OCR'd **and** all of its figure pages are described (or failed).
 - Resume: a page whose per-page manifest entries all carry a description is skipped (unless `--force`).
 - `collate_report.json` gains a `figure_descriptions` block (`requested` / `done` / `failed` / `comments`).
+- `--description-workers N` — (batch script) dedicated thread pool for the figure-description jobs (default `0` = share the OCR page pool, so a description can wait for a free OCR slot).
 - `--skip-figure-descriptions` turns the whole pass off.
 
 ### Key flags
 
 - `--max-review-iterations` — agentic review cap per chunk, default `3`.
 - `--collation-workers` — (batch script) reserved collation threads, default `workers//16 + 1`.
+- `--description-workers` — (batch script) dedicated description-job pool, default `0` (share the OCR page pool).
 - `--skip-figure-descriptions` — (batch script) disable the Qwen figure-description pass (on by default).
 - `--collate-mode` — `diff` (default) or `full`.
 - `--skip-ocr` / `--skip-review` / `--force` / `--dry-run` / `--plan-only` (batch).
