@@ -1475,6 +1475,31 @@ def main(argv: list[str] | None = None) -> int:
                       run_page_job)
 
             pages_done = 0
+
+            def progress() -> None:
+                """Consolidated progress line: pages, figure-description
+                pages, and hand-offs.  Printed on every description
+                completion and every 10 page completions."""
+                elapsed = time.time() - t_start
+                d_requested = sum(s.desc_requested for s in doc_states)
+                d_settled = sum(s.desc_done + s.desc_failed
+                                for s in doc_states)
+                d_failed = sum(s.desc_failed for s in doc_states)
+                if len(jobs):
+                    page_part = (f"{pages_done}/{len(jobs)} pages "
+                                 f"({pages_ok} ok, {pages_failed} failed, "
+                                 f"{placeholders} placeholders)"
+                                 + (f", avg {elapsed / pages_done:.2f}s/page"
+                                    if pages_done else "")
+                                 + "; ")
+                else:
+                    page_part = ""
+                print(f"Progress: {page_part}"
+                      f"{d_settled}/{d_requested} pages described"
+                      + (f" ({d_failed} failed)" if d_failed else "")
+                      + f"; {handed}/{len(doc_states)} document(s) "
+                        f"handed off for review")
+
             while outstanding > 0:
                 kind, state, job, payload = completions.get()
 
@@ -1504,6 +1529,7 @@ def main(argv: list[str] | None = None) -> int:
                               f"{payload['described']}/{payload['figures']} "
                               f"figure(s) on page {job.page_number} "
                               f"({payload['elapsed']:.1f}s)")
+                    progress()
                     continue
 
                 pages_done += 1
@@ -1581,13 +1607,7 @@ def main(argv: list[str] | None = None) -> int:
                     hand_off(state)
 
                 if pages_done % 10 == 0 or pages_done == len(jobs):
-                    elapsed = time.time() - t_start
-                    print(f"Progress: {pages_done}/{len(jobs)} pages "
-                          f"({pages_ok} ok, {pages_failed} failed, "
-                              f"{placeholders} placeholders), "
-                              f"avg {elapsed / max(pages_done, 1):.2f}s/page, "
-                              f"{handed}/{len(doc_states)} document(s) "
-                              f"handed off")
+                    progress()
 
     # ---- drain the collation workers ---------------------------------------
     doc_results: list[tuple[str, str, str]] = []
