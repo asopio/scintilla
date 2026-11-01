@@ -1,11 +1,6 @@
 version: 7
 platforms:
 - name: linux-64
-  virtual-packages:
-  - __unix=0=0
-  - __linux=4.18
-  - __glibc=2.28
-  - __archspec=0=x86_64
 environments:
   default:
     channels:
@@ -308,6 +303,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/ec/38/5c5e665af542884a8fd3c61725c38453239e13940326b5b70f3ef8881a97/uuid_utils-0.17.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f0/ee/580ca6f29dcab0221db8706badca1bbbb084f1975c4d4e83329c3a7e31f0/nvidia_nvjitlink-13.3.33-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/f4/34/780748d7d78fb4024dd1a290844374dd0d9830da35593c534638a4e9e54e/markdown_katex-202406.1035-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f4/c4/b3e049d2aa3766180c78507110543d9d50894cc97f57de543f1be521dcdc/charset_normalizer-3.4.9-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/f8/62/d9ba6323b9202dd2fe166beab8a86d29465c41a0288cbe229fac60c1ab8d/jsonlines-4.0.0-py3-none-any.whl
@@ -5053,6 +5049,17 @@ packages:
   version: 13.3.33
   sha256: 26a6de7fb4c8fdaa7703d3dad720d6d427ddfea5c48a528fd97c11733ad830e5
   requires_python: '>=3'
+- pypi: https://files.pythonhosted.org/packages/f4/34/780748d7d78fb4024dd1a290844374dd0d9830da35593c534638a4e9e54e/markdown_katex-202406.1035-py2.py3-none-any.whl
+  name: markdown-katex
+  version: '202406.1035'
+  sha256: c1713e85854ddecb641ad96243a8b6cd67367bf1bf8d39b43b3680d7f2b1884d
+  requires_dist:
+  - setuptools
+  - pathlib2 ; python_full_version < '3.4'
+  - typing ; python_full_version < '3.5'
+  - markdown>=3.0,<3.3 ; python_full_version < '3.6'
+  - markdown>=3.0 ; python_full_version >= '3.6'
+  requires_python: '>=2.7'
 - pypi: https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl
   name: pygments
   version: 2.20.0

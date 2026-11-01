@@ -116,7 +116,7 @@ Supported options in `pdf_to_markdown_agentic.py`:
 - `--end-page` — exclusive 0-indexed end page in CLI semantics; internally converted to the requested page range
 - `--continue-on-error` — continue on page/LLM errors
 - `--no-cache-dir` — remove rendered page PNGs after completion
-- `--max-review-iterations` — review loop cap, default `10`
+- `--max-review-iterations` — review loop cap, default `5`
 - `--skip-review` — skip agentic Markdown repair
 - `--skip-figure-extraction` — skip figure detection/cropping/replacement
 - `--figure-extraction-mode` — `vlm` or `heuristic`, default `vlm`
@@ -130,6 +130,8 @@ The review loop lives inside `pdf_to_markdown_agentic.py` and uses a DeepAgents 
 2. read file when validation fails
 3. edit targeted syntax issues
 4. re-validate
+
+`create_review_agent` accepts an optional `extra_checks` callable (`text -> list[str]`). When supplied, the agent's `validate_markdown` tool runs it after the base markdown validation, so the agent sees and can fix problems from additional deterministic checks. The DSOCR2+Qwen pipeline (below) passes a KaTeX compile check this way.
 
 The standalone helper `run_review.py` is currently a hard-coded convenience script for one test output, not a general CLI.
 
@@ -172,6 +174,48 @@ Raw per-page model outputs are cached in `raw_pages/page-NN.txt`, so interrupted
 - `--no-cache-dir` — remove rendered page PNGs after completion
 
 `dsocr2_postprocess.py` also works standalone (`python3 dsocr2_postprocess.py [input.md] [-o OUT] [--figures-dir DIR] [--manifest FILE]`; no-args defaults re-process the Evian sample) and is stdlib-only.
+
+## DSOCR2 + Qwen3.8 collation & review pipeline
+
+Two-model pipeline that turns DSOCR2's raw per-page OCR into clean, canonical Markdown: DSOCR2 (`:18000`) does the OCR, Qwen3.8 (`:8008`) collates the OCR'd pages and an agentic reviewer repairs the result.
+
+- `pdf_to_markdown_dsocr2_qwen.py` — single-document entry point.
+- `pdf_to_markdown_dsocr2_qwen_fast.py` — batch entry point (a thread pool OCRs pages from one or many PDFs while a small dedicated set of collation workers runs the per-document pipeline; `--collation-workers`, default `workers//16 + 1`, reserves threads for collation so OCR of later documents overlaps collation of earlier ones).
+
+Stages (single-document script):
+
+1. page render + DSOCR2 per-page OCR + figure crops (reused from `pdf_to_markdown_dsocr2.py`).
+2. `dsocr2_postprocess.postprocess()` → `md/<stem>_dsocr2.md`.
+3. Qwen3.8 collation, chunked by a mandatory client-side token budget guard; each chunk → `md_chunks/NN_<stem>.md`.
+4. Qwen3.8 agentic per-chunk review (DeepAgents, reusing `create_review_agent` / `validate_markdown` from `pdf_to_markdown_agentic.py`), driven by deterministic extended validation: markdown lib, pandoc, math balance, **KaTeX compile**, table columns, heading ladder, figure refs vs manifest, OCR-artifact scan.
+5. deterministic merge → `md/<stem>_qwen_final.md` + global checks + `collate_report.json`.
+
+### KaTeX math validation
+
+The web renderer compiles `$…$` / `$$…$$` math with KaTeX, so the review step verifies it deterministically with the `markdown-katex` package's bundled KaTeX CLI (`pixi add --pypi markdown-katex`). `check_katex` extracts every math span — inline `$…$`, whole-line `$$…$$`, and mid-line `$$ … $$` (the `convert_math` convention); code fences/spans are ignored — and compiles each one directly via `markdown_katex.wrapper.tex2html`, the same backend the python-markdown extension uses internally. That per-formula call collects **all** failures in one pass, where a single `markdown.convert` would abort at the first error (forcing an O(broken × total) re-convert loop on math-heavy chunks). A 24 h content-addressed cache in `/tmp/mdkatex` makes repeats nearly free (~5 ms vs ~110 ms for the first spawn of the CLI). The check feeds both the deterministic validation that drives the loop and the agent's own `validate_markdown` tool (passed as `extra_checks`), so the agent sees each KaTeX parse error and can re-validate its fix.
+
+### Review traces
+
+Each reviewed chunk's full agent conversation is written to `review_traces/NN_<stem>.jsonl` next to `review_log.jsonl`, via the LangChain callback API (the same hook LangSmith uses, but to a local file — no account/network). Events cover LLM prompts/responses (with token usage), every tool call (input + result), and graph runs.
+
+### Figure descriptions (batch script)
+
+In `pdf_to_markdown_dsocr2_qwen_fast.py`, as soon as a page's OCR completes, a figure-description job (same thread pool) sends the **whole rendered page image** plus that page's OCR text to Qwen3.8 and asks for a fixed-schema JSON object (`desc_figure_1`, `desc_figure_2`, … — one key per figure block the OCR job extracted for the page). The values are cached in the per-page figure manifest (`raw_pages/figures_page-NN.json`, a `"description"` field on each entry), and the collation stage injects them as `<!-- Figure k, description: … -->` comments immediately after each `![Figure k](…)` image tag in `md/<stem>_dsocr2.md`; the collation/review prompts in `pdf_to_markdown_dsocr2_qwen.py` were extended to preserve those comments, so they carry through to the final markdown.
+
+- `desc_figure_k` maps to the k-th manifest entry (crop order = OCR reading order); if the model numbers the figures differently, a description can land on the wrong figure — accepted trade-off for exotic multi-column layouts.
+- One corrective retry on unparseable JSON; partial key coverage is kept. A failed page description warns to stderr and the document continues (its figures stay undescribed). Per-request timeout 600 s, `max_tokens` 8192, temperature 0.
+- A document is handed to the collation workers only once all of its pages are OCR'd **and** all of its figure pages are described (or failed).
+- Resume: a page whose per-page manifest entries all carry a description is skipped (unless `--force`).
+- `collate_report.json` gains a `figure_descriptions` block (`requested` / `done` / `failed` / `comments`).
+- `--skip-figure-descriptions` turns the whole pass off.
+
+### Key flags
+
+- `--max-review-iterations` — agentic review cap per chunk, default `3`.
+- `--collation-workers` — (batch script) reserved collation threads, default `workers//16 + 1`.
+- `--skip-figure-descriptions` — (batch script) disable the Qwen figure-description pass (on by default).
+- `--collate-mode` — `diff` (default) or `full`.
+- `--skip-ocr` / `--skip-review` / `--force` / `--dry-run` / `--plan-only` (batch).
 
 ## Markdown → HTML / EPUB pipeline
 

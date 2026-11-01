@@ -11,12 +11,24 @@ following the workflow of ``pdf_md_convert_vlm_fast.py``:
     ``raw_pages/page-NN.txt``), and crops the figure det boxes into
     ``figures/`` plus a per-page manifest entry in
     ``raw_pages/figures_page-NN.json``.
+  * as soon as a page's OCR completes, a figure-description job (same
+    pool) sends the whole rendered page image plus the page's OCR text
+    to Qwen3.8, which returns one concise description per figure block
+    in a fixed JSON schema (``desc_figure_1``, ``desc_figure_2``, ...);
+    the values are cached in the per-page manifest (a ``"description"``
+    field on each entry).  ``--skip-figure-descriptions`` opts out.  A
+    page whose description fails (one corrective retry on unparseable
+    JSON) warns and continues with undescribed figures.
   * a small dedicated set of collation workers runs in parallel with
     the pool (``--collation-workers``, default ``workers//16 + 1``;
     the OCR page pool gets ``workers - collation-workers`` threads).
     A document is handed to a worker as soon as all of its pages are
-    done (the worker re-checks the raw pages on disk, so it can never
-    build a partial deck).  There it performs the single-document
+    OCR'd and all of its figure pages described (the worker re-checks
+    the raw pages on disk, so it can never build a partial deck).  It
+    first injects the cached descriptions as
+    ``<!-- Figure k, description: ... -->`` comments after each
+    ``![Figure k](...)`` image tag in the post-processed markdown, then
+    performs the single-document
     script's per-document pipeline, reusing that script's stage
     machinery (``pdf_to_markdown_dsocr2_qwen``):
 
@@ -43,6 +55,8 @@ script):
     pages/page-NN.png               rendered page images (cache)
     raw_pages/page-NN.txt           raw per-page OCR output (cache)
     raw_pages/figures_page-NN.json  per-page figure manifest entries
+                                    ("description" per entry once the
+                                    Qwen pass has run)
     <stem>_dsocr2.md                raw grounding dump
     figures/page-NN-fKK.png         cropped figures
     figures_manifest.json           assembled crop manifest
@@ -64,6 +78,8 @@ Usage:
   pixi run python pdf_to_markdown_dsocr2_qwen_fast.py a.pdf --skip-ocr
 
 Resume: page jobs skip pages whose ``raw_pages/page-NN.txt`` exists
+(unless ``--force``); figure-description jobs skip pages whose
+per-page manifest entries all already carry a ``"description"``
 (unless ``--force``); a collation worker skips chunks whose
 ``md_chunks/NN_<stem>.md`` exists; a document whose
 ``md/<stem>_qwen_final.md`` exists is skipped entirely.
@@ -79,15 +95,17 @@ missing pages, then finishes the document.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -147,6 +165,26 @@ class PageJob:
 
 
 @dataclass(frozen=True)
+class DescJob:
+    """Everything a pool thread needs to describe one page's figures
+    (whole-page image + page text -> one Qwen call, fixed JSON schema).
+    Runs in the same pool as the page jobs, right after the page's OCR
+    completes."""
+
+    pdf_path: str
+    pdf_name: str
+    page_number: int
+    outdir: str
+    width: int
+    dpi: int
+    force: bool
+    base_url: str
+    api_key: str
+    model: str
+    retries: int
+
+
+@dataclass(frozen=True)
 class DocumentRecord:
     """Bookkeeping for one PDF (main thread only)."""
 
@@ -173,22 +211,30 @@ class DocState:
     ``finished`` counts the document's requested pages that are done --
     already on disk at startup, completed in this run, replaced by a
     blank placeholder (``--continue-on-error``), or cancelled because
-    the document aborted.  As soon as it reaches the expected count the
-    document is handed to the collation workers (which re-verify on
-    disk, so a partial deck can never be built).
+    the document aborted.  ``desc_requested`` / ``desc_pending`` count
+    the figure-description jobs seeded for the document's pages
+    (``desc_pending`` reaches zero as they complete).  Once
+    ``finished`` reaches the expected count AND ``desc_pending`` is
+    zero, the document is handed to the collation workers (which
+    re-verify on disk, so a partial deck can never be built).
     """
 
-    __slots__ = ("aborted", "doc", "finished", "handed_off")
+    __slots__ = ("aborted", "desc_done", "desc_failed", "desc_pending",
+                 "desc_requested", "doc", "finished", "handed_off")
 
     def __init__(self, doc: DocumentRecord) -> None:
         self.doc = doc
         self.finished = 0
         self.handed_off = False
         self.aborted = False
+        self.desc_requested = 0
+        self.desc_pending = 0
+        self.desc_done = 0
+        self.desc_failed = 0
 
 
 # ---------------------------------------------------------------------------
-# Shared DSOCR2 clients (one per endpoint; the OpenAI client is
+# Shared LLM clients (one per endpoint + timeout; the OpenAI client is
 # thread-safe, so the pool shares them)
 # ---------------------------------------------------------------------------
 
@@ -196,8 +242,8 @@ _CLIENT_CACHE: dict[tuple, OpenAI] = {}
 _CLIENT_LOCK = threading.Lock()
 
 
-def _get_dsocr2_client(base_url: str, api_key: str, timeout: float,
-                       retries: int) -> OpenAI:
+def _get_llm_client(base_url: str, api_key: str, timeout: float,
+                    retries: int) -> OpenAI:
     key = (base_url, api_key, timeout, retries)
     with _CLIENT_LOCK:
         client = _CLIENT_CACHE.get(key)
@@ -206,6 +252,19 @@ def _get_dsocr2_client(base_url: str, api_key: str, timeout: float,
                             timeout=timeout, max_retries=retries)
             _CLIENT_CACHE[key] = client
         return client
+
+
+def _get_dsocr2_client(base_url: str, api_key: str, timeout: float,
+                       retries: int) -> OpenAI:
+    return _get_llm_client(base_url, api_key, timeout, retries)
+
+
+def _get_qwen_client(base_url: str, api_key: str, timeout: float,
+                     retries: int) -> OpenAI:
+    """Qwen client for the figure-description calls.  Shares the client
+    cache; the key includes the timeout, so the description client
+    (DESC_TIMEOUT) never collides with the collation client (7200 s)."""
+    return _get_llm_client(base_url, api_key, timeout, retries)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +367,164 @@ def _write_placeholder(job: PageJob) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Figure-description worker (runs in the same pool as the page jobs,
+# launched as soon as a page's OCR completes)
+# ---------------------------------------------------------------------------
+
+DESC_TIMEOUT = 600.0        # per description request (seconds)
+DESC_MAX_TOKENS = 8192      # headroom for several figures per page
+DESC_MARKER_RE = re.compile(r"^\s*<\|ref\|>.*<\|/(?:det|ref)\|>\s*$")
+
+
+def _page_content(raw: str) -> str:
+    """The page's OCR text with the layout marker lines stripped."""
+    content = "\n".join(line for line in raw.splitlines()
+                        if not DESC_MARKER_RE.match(line)).strip()
+    return content or "(no text content extracted for this page)"
+
+
+def _figure_desc_system(n: int) -> str:
+    """System prompt for one page: the model must describe exactly the
+    n figure blocks the OCR job extracted, in a fixed JSON schema."""
+    keys = ", ".join(f'"desc_figure_{k}": ""' for k in range(1, n + 1))
+    return (
+        "The following image is a page from a document that contains exactly "
+        f"{n} figure(s). Describe each figure: chart type, axes, legend, "
+        "curves/bars, and the most salient values, maxima, minima or trends. "
+        "Do not invent content that is not visible in the plots. Number the "
+        "figures in reading order (top to bottom, then left to right). For "
+        "context, the text content of the document page is also provided.\n\n"
+        "Respond with ONLY a valid JSON object with exactly "
+        f"{n} keys, in this form:\n{{{keys}}}\n"
+        "Fill each value with one or two concise sentences describing that "
+        "figure. No markdown fences, no commentary outside the JSON."
+    )
+
+
+def _parse_desc_json(text: str, n: int) -> dict[str, str] | None:
+    """Parse the model's JSON response.  Returns None when unparseable;
+    otherwise a (possibly partial) mapping ``desc_figure_k -> value`` --
+    missing keys simply mean those figures stay undescribed."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t)
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        obj = json.loads(t[i:j + 1])
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return {k: obj[k] for k in (f"desc_figure_{k}" for k in range(1, n + 1))
+            if isinstance(obj.get(k), str) and obj.get(k).strip()}
+
+
+def _page_needs_desc(outdir: Path, n: int, width: int,
+                     force: bool) -> bool:
+    """True when an already-OCR'd page still needs a description job:
+    its per-page manifest has figure entries and (unless ``force``) at
+    least one lacks a cached ``"description"``.  A missing file (e.g. a
+    page OCR'd before per-page manifests existed) or an empty list means
+    there is nothing to describe."""
+    figs = outdir / "raw_pages" / f"figures_page-{n:0{width}d}.json"
+    if not figs.is_file():
+        return False
+    try:
+        entries = json.loads(figs.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not entries:
+        return False
+    if force:
+        return True
+    return any(not (e.get("description") or "").strip() for e in entries)
+
+
+def run_figure_desc_job(job: DescJob) -> dict:
+    """Pool entry point: one Qwen vision call describing every figure on
+    one page.  The whole rendered page image plus the page's OCR text go
+    in; a fixed-schema JSON object comes out.  ``desc_figure_k`` maps to
+    the k-th entry of the per-page figure manifest (crop order = OCR
+    reading order).  The values are written back into that manifest, so
+    the collation stage picks them up with no extra plumbing.  Raises
+    on a failed request or on JSON that stays unparseable after one
+    corrective retry (the main thread warns and continues)."""
+    outdir = Path(job.outdir)
+    n = job.page_number
+    w = job.width
+    t0 = time.time()
+
+    figs_json = outdir / "raw_pages" / f"figures_page-{n:0{w}d}.json"
+    if not figs_json.is_file():
+        raise RuntimeError(f"no per-page figure manifest {figs_json}")
+    entries = json.loads(figs_json.read_text(encoding="utf-8"))
+    if not entries:
+        return {"status": "none", "page": n, "pdf": job.pdf_name,
+                "figures": 0, "described": 0, "elapsed": time.time() - t0}
+
+    raw_path = outdir / "raw_pages" / f"page-{n:0{w}d}.txt"
+    raw = raw_path.read_text(encoding="utf-8") if raw_path.is_file() else ""
+
+    img_path = outdir / "pages" / f"page-{n:0{w}d}.png"
+    if not img_path.exists():
+        # Re-render for a resume after --no-cache-dir removed pages/.
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered = render_pdf_page(job.pdf_path, str(img_path.parent / "page"),
+                                   job.dpi, n)
+        if rendered != str(img_path):
+            os.replace(rendered, str(img_path))
+    data_url = ("data:image/png;base64,"
+                + base64.b64encode(img_path.read_bytes()).decode())
+
+    client = _get_qwen_client(job.base_url, job.api_key, DESC_TIMEOUT,
+                              job.retries)
+    messages = [
+        {"role": "system", "content": _figure_desc_system(len(entries))},
+        {"role": "user", "content": [
+            {"type": "image_url",
+             "image_url": {"url": data_url}},
+            {"type": "text",
+             "text": "<begin page content>\n" + _page_content(raw)
+                     + "\n<end page content>"},
+        ]},
+    ]
+    resp = client.chat.completions.create(
+        model=job.model, messages=messages,
+        temperature=0, max_tokens=DESC_MAX_TOKENS)
+    content = resp.choices[0].message.content or ""
+    parsed = _parse_desc_json(content, len(entries))
+    if parsed is None:
+        # One corrective retry: show the model its unparseable answer.
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user",
+                         "content": "Your previous response was not valid "
+                                     "JSON. Respond again with ONLY the "
+                                     "JSON object."})
+        resp = client.chat.completions.create(
+            model=job.model, messages=messages,
+            temperature=0, max_tokens=DESC_MAX_TOKENS)
+        parsed = _parse_desc_json(resp.choices[0].message.content or "",
+                                  len(entries))
+        if parsed is None:
+            raise RuntimeError(
+                "figure description response was not valid JSON "
+                "(after one corrective retry)")
+
+    for k, entry in enumerate(entries, 1):
+        v = parsed.get(f"desc_figure_{k}")
+        if v is not None:
+            entry["description"] = re.sub(r"\s+", " ", v).strip()
+    figs_json.write_text(json.dumps(entries, indent=1) + "\n",
+                         encoding="utf-8")
+    return {"status": "ok", "page": n, "pdf": job.pdf_name,
+            "figures": len(entries), "described": len(parsed),
+            "elapsed": time.time() - t0}
+
+
+# ---------------------------------------------------------------------------
 # Figure-manifest assembly (collation thread)
 # ---------------------------------------------------------------------------
 
@@ -346,6 +563,46 @@ def assemble_manifest(outdir: Path, doc: DocumentRecord,
         note(f"assembling a partial figure manifest ({len(manifest)} "
              f"figure(s)) from the per-page files present")
     return manifest
+
+
+# ---------------------------------------------------------------------------
+# Figure-description injection (collation thread)
+# ---------------------------------------------------------------------------
+
+_IMG_TAG_RE = re.compile(r"^!\[Figure (\d+)\]\(([^)]+)\)\s*$")
+
+
+def inject_figure_descriptions(text: str,
+                               manifest: list[dict]) -> tuple[str, int]:
+    """Insert a ``<!-- Figure k, description: ... -->`` comment line
+    after each ``![Figure k](rel)`` image tag whose manifest entry
+    carries a cached description.  The relative path is computed exactly
+    the way ``dsocr2_postprocess`` builds it (``os.path.relpath(file,
+    "md")`` -> ``../figures/...``), so the comment always lands on the
+    matching image line.  Returns the new text and the number of
+    comments injected."""
+    desc_by_rel: dict[str, str] = {}
+    for e in manifest:
+        desc = (e.get("description") or "").strip()
+        if not desc:
+            continue
+        desc_by_rel[os.path.relpath(e["file"], "md")] = desc
+
+    lines = text.splitlines()
+    out: list[str] = []
+    injected = 0
+    for line in lines:
+        out.append(line)
+        m = _IMG_TAG_RE.match(line)
+        if m:
+            desc = desc_by_rel.get(m.group(2))
+            if desc:
+                out.append("<!-- Figure " + m.group(1)
+                           + ", description: "
+                           + desc.replace("-->", "-- >") + " -->")
+                injected += 1
+    trailing = "\n" if text.endswith("\n") else ""
+    return "\n".join(out) + trailing, injected
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +666,8 @@ class _CollateContext:
 # Per-document pipeline (runs on a collation worker thread)
 # ---------------------------------------------------------------------------
 
-def process_document(doc: DocumentRecord, ctx: _CollateContext) -> dict:
+def process_document(doc: DocumentRecord, ctx: _CollateContext,
+                     state: DocState) -> dict:
     """The single-document script's stages 1.5-4 for one document.
 
     Returns a small result record whose ``status`` is one of
@@ -470,6 +728,14 @@ def process_document(doc: DocumentRecord, ctx: _CollateContext) -> dict:
         say(f"postprocess problem: {prob}")
 
     post_text = dsocr2_md.read_text(encoding="utf-8")
+    desc_comments = 0
+    if not args.skip_figure_descriptions:
+        post_text, desc_comments = inject_figure_descriptions(post_text,
+                                                              manifest)
+        if desc_comments:
+            dsocr2_md.write_text(post_text, encoding="utf-8")
+            say(f"figure descriptions: {desc_comments} comment(s) "
+                f"injected into {dsocr2_md.name}")
     try:
         _pre, post_sections = split_slides(post_text)
     except ValueError:
@@ -492,6 +758,10 @@ def process_document(doc: DocumentRecord, ctx: _CollateContext) -> dict:
                  "model": args.qwen_model},
         "ocr": {"pages_ocred": len(pages_text),
                 "figures": len(manifest)},
+        "figure_descriptions": {"requested": state.desc_requested,
+                                "done": state.desc_done,
+                                "failed": state.desc_failed,
+                                "comments": desc_comments},
         "postprocess": {k: pp[k] for k in
                         ("slides", "images", "tables", "equations")},
     }
@@ -677,7 +947,7 @@ def _collation_worker(requests: queue.Queue, results: queue.Queue,
             break
         doc = state.doc
         try:
-            result = process_document(doc, ctx)
+            result = process_document(doc, ctx, state)
         except Exception as exc:
             print(f"COLLATE FAILED {doc.pdf_name}:\n"
                   f"{traceback.format_exc()}", file=sys.stderr)
@@ -766,6 +1036,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="stop at the first page error")
     p.add_argument("--skip-figures", action="store_true",
                    help="do not crop figures (empty manifest)")
+    p.add_argument("--skip-figure-descriptions", action="store_true",
+                   help="do not ask Qwen for figure descriptions (by "
+                        "default every figure page is described by one "
+                        "whole-page Qwen call as soon as its OCR "
+                        "completes, and the descriptions are injected "
+                        "as <!-- Figure k, description: ... --> comments)")
     p.add_argument("--skip-ocr", action="store_true",
                    help="no page jobs; hand every document straight to the "
                         "collation workers (its raw pages must be on disk; "
@@ -858,6 +1134,23 @@ def _make_job(doc: DocumentRecord, n: int, args: argparse.Namespace,
         retries=args.dsocr2_retries,
         skip_figures=args.skip_figures,
         dry_run=dry_run,
+    )
+
+
+def _make_desc_job(doc: DocumentRecord, n: int,
+                   args: argparse.Namespace) -> DescJob:
+    return DescJob(
+        pdf_path=doc.pdf_path,
+        pdf_name=doc.pdf_name,
+        page_number=n,
+        outdir=doc.outdir,
+        width=doc.width,
+        dpi=args.dpi,
+        force=args.force,
+        base_url=args.qwen_base_url,
+        api_key=args.qwen_api_key,
+        model=args.qwen_model,
+        retries=args.qwen_retries,
     )
 
 
@@ -963,6 +1256,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- build page jobs + per-document state ------------------------------
     jobs: list[PageJob] = []
+    # Description jobs for pages already on disk (cached raw / --skip-ocr);
+    # pages OCR'd in this run seed their own description job as soon as
+    # the page job completes.  Counters below must be set BEFORE the
+    # initial hand-off loop, or cached documents would be handed over
+    # before their description jobs are seeded.
+    desc_jobs: list[DescJob] = []
+    desc_enabled = (not args.dry_run and not args.plan_only
+                    and not args.skip_figure_descriptions)
     doc_states: list[DocState] = []
     skipped_docs: list[str] = []
     pages_total = 0
@@ -981,20 +1282,26 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 jobs.append(_make_job(doc, n, args, dry_run=True))
                 continue
-            if args.skip_ocr:
+            done = args.skip_ocr
+            if not done:
+                raw = (Path(doc.outdir) / "raw_pages"
+                       / f"page-{n:0{doc.width}d}.txt")
+                done = raw.exists() and not args.force
+            if done:
                 state.finished += 1
+                if desc_enabled and _page_needs_desc(
+                        Path(doc.outdir), n, doc.width, args.force):
+                    state.desc_requested += 1
+                    state.desc_pending += 1
+                    desc_jobs.append(_make_desc_job(doc, n, args))
                 continue
-            raw = (Path(doc.outdir) / "raw_pages"
-                   / f"page-{n:0{doc.width}d}.txt")
-            if raw.exists() and not args.force:
-                state.finished += 1
-            else:
-                jobs.append(_make_job(doc, n, args))
+            jobs.append(_make_job(doc, n, args))
 
     # ---- reachability checks (fail early, like the single-doc script) ------
     need_ocr = not args.dry_run and not args.skip_ocr and bool(jobs)
-    need_qwen = (not args.dry_run and bool(doc_states) and not args.plan_only
-                 and not (args.skip_collate and args.skip_review))
+    need_qwen = ((not args.dry_run and bool(doc_states) and not args.plan_only
+                  and not (args.skip_collate and args.skip_review))
+                 or (desc_enabled and bool(desc_jobs)))
 
     if need_ocr:
         client = _get_dsocr2_client(args.dsocr2_base_url,
@@ -1029,7 +1336,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- banner -------------------------------------------------------------
     t_start = time.time()
-    pool_workers = max(1, min(page_workers, len(jobs) or 1))
+    pool_workers = max(1, min(page_workers, len(jobs) + len(desc_jobs) or 1))
     n_collators = (0 if (args.dry_run or not doc_states)
                    else min(collation_workers, len(doc_states)))
     print(f"DSOCR2 + Qwen3.8 batch workflow: {len(documents)} document(s), "
@@ -1040,10 +1347,12 @@ def main(argv: list[str] | None = None) -> int:
               f"{pool_workers} parallel pdftoppm workers "
               f"(no OCR, no collation)")
     else:
-        print(f"Page pool: {len(jobs)} job(s) with up to {pool_workers} "
-              f"threads -> {args.dsocr2_base_url} ({args.dsocr2_model}); "
-              f"{n_collators} collation thread(s) -> {args.qwen_base_url} "
-              f"({args.qwen_model}) for {len(doc_states)} document(s)")
+        print(f"Page pool: {len(jobs)} OCR job(s) + {len(desc_jobs)} "
+              f"figure-description job(s) with up to {pool_workers} "
+              f"threads -> {args.dsocr2_base_url} ({args.dsocr2_model}) / "
+              f"{args.qwen_base_url} ({args.qwen_model}); "
+              f"{n_collators} collation thread(s) for "
+              f"{len(doc_states)} document(s)")
 
     # ---- collation workers (run in parallel with the page pool) ----------
     requests: queue.Queue = queue.Queue()
@@ -1054,17 +1363,21 @@ def main(argv: list[str] | None = None) -> int:
 
     def hand_off(state: DocState) -> None:
         """Hand a document to the collation workers once all of its
-        pages are done (a worker re-verifies on disk before building)."""
+        pages are done AND every figure page is described (a worker
+        re-verifies on disk before building)."""
         nonlocal handed
         if not collators or state.handed_off:
             return
         expected_n = state.doc.last_page - state.doc.first_page + 1
-        if state.finished >= expected_n:
+        if state.finished >= expected_n and state.desc_pending == 0:
             state.handed_off = True
             handed += 1
+            desc_note = (f"; {state.desc_done}/{state.desc_requested} "
+                         f"figure page(s) described") \
+                if state.desc_requested else ""
             print(f"handing off {state.doc.pdf_name} to the collation "
                   f"worker(s) ({state.finished}/{expected_n} pages "
-                  f"ready)")
+                  f"ready{desc_note})")
             requests.put(state)
 
     if n_collators:
@@ -1085,19 +1398,82 @@ def main(argv: list[str] | None = None) -> int:
     pages_failed = 0
     placeholders = 0
     dry_count = 0
+    desc_ok = 0
+    desc_failed = 0
     stopping = False
 
-    if jobs:
+    if jobs or desc_jobs:
         with ThreadPoolExecutor(max_workers=pool_workers,
                                  thread_name_prefix="page") as pool:
-            futures = {pool.submit(run_page_job, job): job for job in jobs}
-            completed = 0
-            for future in as_completed(futures):
-                job = futures[future]
-                completed += 1
-                state = state_by_pdf.get(job.pdf_path)
+            # A page job that succeeds can spawn a figure-description
+            # job, so a static as_completed over the initial batch could
+            # never see the later futures.  Instead every submitted
+            # future pushes (kind, state, job, payload) onto a
+            # completion queue, and the loop below drains it.
+            futures: dict = {}
+            completions: queue.Queue = queue.Queue()
+            outstanding = 0
 
-                if future.cancelled():
+            def track(kind: str, state: DocState | None, job, fn) -> None:
+                nonlocal outstanding
+                fut = pool.submit(fn, job)
+                futures[fut] = (kind, state, job)
+                outstanding += 1
+
+                def done(f) -> None:
+                    nonlocal outstanding
+                    outstanding -= 1
+                    try:
+                        payload = f.result()
+                    except CancelledError:
+                        payload = "cancelled"
+                    except Exception as error:
+                        payload = error
+                    completions.put((kind, state, job, payload))
+
+                fut.add_done_callback(done)
+
+            for djob in desc_jobs:
+                track("desc", state_by_pdf.get(djob.pdf_path), djob,
+                      run_figure_desc_job)
+            for job in jobs:
+                track("page", state_by_pdf.get(job.pdf_path), job,
+                      run_page_job)
+
+            pages_done = 0
+            while outstanding > 0:
+                kind, state, job, payload = completions.get()
+
+                if kind == "desc":
+                    if payload == "cancelled":
+                        if state is not None:
+                            state.desc_pending -= 1
+                            hand_off(state)
+                        continue
+                    if isinstance(payload, Exception):
+                        desc_failed += 1
+                        if state is not None:
+                            state.desc_pending -= 1
+                            state.desc_failed += 1
+                            hand_off(state)
+                        print(f"[{job.pdf_name}] figure descriptions for "
+                              f"page {job.page_number} failed: {payload} "
+                              f"(document continues without them)",
+                              file=sys.stderr)
+                    else:
+                        desc_ok += 1
+                        if state is not None:
+                            state.desc_pending -= 1
+                            state.desc_done += 1
+                            hand_off(state)
+                        print(f"[{job.pdf_name}] described "
+                              f"{payload['described']}/{payload['figures']} "
+                              f"figure(s) on page {job.page_number} "
+                              f"({payload['elapsed']:.1f}s)")
+                    continue
+
+                pages_done += 1
+                if payload == "cancelled":
                     # Page never ran (its document aborted); count it so
                     # the hand-off can trigger.
                     if state is not None:
@@ -1105,24 +1481,25 @@ def main(argv: list[str] | None = None) -> int:
                         hand_off(state)
                     continue
 
-                try:
-                    result = future.result()
-                except Exception as error:
+                if isinstance(payload, Exception):
+                    error = payload
                     pages_failed += 1
                     if state is not None:
                         state.finished += 1
                         if args.continue_on_error:
                             _write_placeholder(job)
                             placeholders += 1
-                            print(f"[{completed}/{len(jobs)}] placeholder "
+                            print(f"[{pages_done}/{len(jobs)}] placeholder "
                                   f"{job.pdf_name} page {job.page_number} "
                                   f"(OCR failed: {error})")
                         else:
                             state.aborted = True
-                            for fut, fj in futures.items():
+                            # Cancel the document's remaining page AND
+                            # description futures.
+                            for fut, (_fkind, _fst, fj) in futures.items():
                                 if fj.pdf_path == job.pdf_path:
                                     fut.cancel()
-                            print(f"[{completed}/{len(jobs)}] FAILED "
+                            print(f"[{pages_done}/{len(jobs)}] FAILED "
                                   f"{job.pdf_name} page {job.page_number}: "
                                   f"{error} (document aborted; re-run to "
                                   f"retry)", file=sys.stderr)
@@ -1133,7 +1510,7 @@ def main(argv: list[str] | None = None) -> int:
                                 break
                         hand_off(state)
                     else:
-                        print(f"[{completed}/{len(jobs)}] FAILED "
+                        print(f"[{pages_done}/{len(jobs)}] FAILED "
                               f"{job.pdf_name} page {job.page_number}: "
                               f"{error}", file=sys.stderr)
                         if args.fail_fast:
@@ -1143,30 +1520,38 @@ def main(argv: list[str] | None = None) -> int:
                             break
                     continue
 
+                result = payload
                 if result["status"] == "dry":
                     dry_count += 1
-                    print(f"[{completed}/{len(jobs)}] dry-run "
+                    print(f"[{pages_done}/{len(jobs)}] dry-run "
                           f"{job.pdf_name} page {job.page_number}: "
                           f"{result['image_bytes'] // 1024} KB "
                           f"({result['elapsed']:.1f}s)")
                 else:
                     pages_ok += 1
                     verb = "ocr" if result["ocred"] else "cache"
-                    print(f"[{completed}/{len(jobs)}] {verb} "
+                    print(f"[{pages_done}/{len(jobs)}] {verb} "
                           f"{job.pdf_name} page {job.page_number}: "
                           f"{result['chars']} chars, "
                           f"{result['figures']} figure(s), "
                           f"{result['elapsed']:.1f}s")
+                    if (desc_enabled and state is not None
+                            and result["figures"] > 0):
+                        djob = _make_desc_job(state.doc, result["page"],
+                                              args)
+                        state.desc_requested += 1
+                        state.desc_pending += 1
+                        track("desc", state, djob, run_figure_desc_job)
                 if state is not None:
                     state.finished += 1
                     hand_off(state)
 
-                if completed % 10 == 0 or completed == len(jobs):
+                if pages_done % 10 == 0 or pages_done == len(jobs):
                     elapsed = time.time() - t_start
-                    print(f"Progress: {completed}/{len(jobs)} pages "
+                    print(f"Progress: {pages_done}/{len(jobs)} pages "
                           f"({pages_ok} ok, {pages_failed} failed, "
                           f"{placeholders} placeholders), "
-                          f"avg {elapsed / max(completed, 1):.2f}s/page, "
+                          f"avg {elapsed / max(pages_done, 1):.2f}s/page, "
                           f"{handed}/{len(doc_states)} document(s) "
                           f"handed off")
 
@@ -1187,7 +1572,8 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.time() - t_start
     print(f"\nDone in {elapsed / 60:.1f} min: pages ok={pages_ok} "
           f"failed={pages_failed} placeholder={placeholders} "
-          f"dry={dry_count}")
+          f"dry={dry_count} figure-descs ok={desc_ok} "
+          f"failed={desc_failed}")
     by_name = {name: (status, info) for status, name, info in doc_results}
     for doc in documents:
         if doc.pdf_name in by_name:
