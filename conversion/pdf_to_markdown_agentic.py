@@ -259,8 +259,15 @@ def validate_markdown(file_path: str) -> str:
     return "VALIDATION PASSED: file is valid markdown."
 
 
-def create_review_agent(llm, system_prompt: str):
-    """Create a DeepAgents reviewer with three tools: read_file, edit_file, validate_markdown."""
+def create_review_agent(llm, system_prompt: str, extra_checks=None):
+    """Create a DeepAgents reviewer with three tools: read_file, edit_file, validate_markdown.
+
+    ``extra_checks`` is an optional callable ``text -> list[str]``.  When
+    given, the ``validate_markdown`` tool runs it after the base markdown
+    validation, so the agent also sees (and can fix) problems from
+    additional deterministic checks — e.g. a KaTeX compile check.  When
+    omitted, behaviour is exactly the base markdown-only validation.
+    """
     review_model = ChatOpenAI(
         model=llm.model,
         api_key=str(llm.openai_api_key) if hasattr(llm, "openai_api_key") else llm.api_key,
@@ -268,9 +275,32 @@ def create_review_agent(llm, system_prompt: str):
         use_responses_api=False,
     )
 
+    if extra_checks is None:
+        tools = [validate_markdown]
+    else:
+
+        @tool("validate_markdown")
+        def validate_markdown_plus(file_path: str) -> str:
+            """Validate markdown syntax and math (KaTeX) in a file.
+
+            Runs the Python markdown parser plus extra deterministic
+            checks (e.g. KaTeX compilation of $...$ / $$...$$ math).
+            Returns the full validation result (errors or success).
+            """
+            try:
+                text = Path(file_path).read_text(encoding="utf-8")
+            except Exception as exc:
+                return f"ERROR reading file: {exc}"
+            errors = _validate_markdown_text(text) + list(extra_checks(text))
+            if errors:
+                return "VALIDATION ERRORS:\n" + "\n".join(errors)
+            return "VALIDATION PASSED: file is valid markdown and math."
+
+        tools = [validate_markdown_plus]
+
     agent = create_deep_agent(
         model=review_model,
-        tools=[validate_markdown],
+        tools=tools,
         system_prompt=system_prompt,
     )
     return agent
