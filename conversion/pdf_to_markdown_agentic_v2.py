@@ -1202,7 +1202,8 @@ REVIEW_SYSTEM_PROMPT = (
     "- read_file: read the current contents of a file\n"
     "- edit_file: make targeted fixes to a file\n"
     "- validate_markdown: run the Python markdown parser on a file and get "
-    "structured error output (or a PASS message)\n\n"
+    "structured error output (or a PASS message)\n"
+    "All file paths are relative to your /workspace directory.\n\n"
     "Your workflow:\n"
     "1. Call validate_markdown on the target file to get a list of errors\n"
     "2. If validation passed, report success and stop\n"
@@ -1237,6 +1238,31 @@ def review_markdown_file(file_path: str, model: str, api_key: str, base_url: str
     from langchain_core.messages import HumanMessage
     from langchain_core.tools import tool
     from deepagents import create_deep_agent
+    from deepagents.backends import (
+        CompositeBackend,
+        FilesystemBackend,
+        StateBackend,
+    )
+
+    abs_path = Path(file_path).resolve()
+    file_name = abs_path.name
+    # Mount the file's directory at /workspace so the built-in file
+    # tools (read_file/edit_file) and validate_markdown share one
+    # namespace with the real disk.  deepagents' default backend is an
+    # empty in-memory StateBackend, where the file tools can never
+    # see the target file (and edits would be lost on disk).
+    workspace = abs_path.parent
+    backend = CompositeBackend(
+        default=StateBackend(),
+        routes={"/workspace/": FilesystemBackend(
+            root_dir=str(workspace), virtual_mode=True)},
+    )
+
+    def _resolve(vpath: str) -> Path:
+        rel = vpath
+        if rel.startswith("/workspace/"):
+            rel = rel[len("/workspace/"):]
+        return workspace / rel.lstrip("/")
 
     @tool
     def validate_markdown(file_path: str) -> str:
@@ -1244,10 +1270,7 @@ def review_markdown_file(file_path: str, model: str, api_key: str, base_url: str
 
         Returns the full validation result (errors or success message).
         """
-        return _validate_markdown_tool(file_path)
-
-    abs_path = str(Path(file_path).resolve())
-    file_name = Path(abs_path).name
+        return _validate_markdown_tool(_resolve(file_path))
 
     print(f"\n=== Agentic Markdown Review ({file_name}) ===")
 
@@ -1261,10 +1284,12 @@ def review_markdown_file(file_path: str, model: str, api_key: str, base_url: str
         model=review_model,
         tools=[validate_markdown],
         system_prompt=REVIEW_SYSTEM_PROMPT,
+        backend=backend,
     )
 
     task_desc = (
-        f"Review and fix markdown syntax in the file '{abs_path}'.\n\n"
+        f"Review and fix markdown syntax in the file "
+        f"'/workspace/{file_name}'.\n\n"
         "Use your validate_markdown tool to check the file, then read_file to see "
         "the content, and edit_file to fix any errors. Re-validate after each fix "
         "cycle. Continue until validate_markdown returns 'VALIDATION PASSED' or you "

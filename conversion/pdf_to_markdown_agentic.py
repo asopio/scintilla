@@ -12,6 +12,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Callable
 
 import markdown
 from langchain_openai import ChatOpenAI
@@ -19,6 +20,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
 from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 
 from list_pdf_figures import analyze_pdf
 
@@ -245,6 +247,10 @@ def _validate_markdown_text(text: str) -> list[str]:
 def validate_markdown(file_path: str) -> str:
     """Validate markdown syntax in a file using the Python markdown library.
 
+    Reads the file from the real disk via its absolute path.  For the
+    review agent prefer ``create_review_agent`` with a ``workspace``,
+    whose validator shares the agent's virtual-filesystem namespace.
+
     Returns the full validation result (errors or success message).
     """
     try:
@@ -259,14 +265,103 @@ def validate_markdown(file_path: str) -> str:
     return "VALIDATION PASSED: file is valid markdown."
 
 
-def create_review_agent(llm, system_prompt: str, extra_checks=None):
-    """Create a DeepAgents reviewer with three tools: read_file, edit_file, validate_markdown.
+# The real directory the review agent works in is mounted at this
+# prefix inside the agent's virtual filesystem (see
+# ``_workspace_backend``).  Task texts must address files as
+# ``/workspace/<path relative to the mounted directory>``.
+WORKSPACE_MOUNT = "/workspace"
 
-    ``extra_checks`` is an optional callable ``text -> list[str]``.  When
-    given, the ``validate_markdown`` tool runs it after the base markdown
-    validation, so the agent also sees (and can fix) problems from
-    additional deterministic checks — e.g. a KaTeX compile check.  When
-    omitted, behaviour is exactly the base markdown-only validation.
+
+def _make_validate_markdown_tool(
+    resolve: Callable[[str], Path], extra_checks=None,
+):
+    """Build the review agent's ``validate_markdown`` tool.
+
+    ``resolve`` maps the tool's ``file_path`` argument onto the real
+    disk.  It must be the same resolver the agent's filesystem backend
+    uses (see ``_workspace_backend``): a validator that reads absolute
+    disk paths while read_file/edit_file operate on a different
+    virtual filesystem would report errors the agent can never fix.
+    """
+
+    @tool("validate_markdown")
+    def validate_markdown_tool(file_path: str) -> str:
+        """Validate markdown syntax and math in a file.
+
+        Runs the Python markdown parser plus extra deterministic
+        checks (e.g. KaTeX compilation of $...$ / $$...$$ math).
+        Returns the full validation result (errors or success).
+        """
+        try:
+            text = resolve(file_path).read_text(encoding="utf-8")
+        except Exception as exc:
+            return f"ERROR reading file: {exc}"
+        errors = _validate_markdown_text(text)
+        if extra_checks is not None:
+            errors += list(extra_checks(text))
+        if errors:
+            return "VALIDATION ERRORS:\n" + "\n".join(errors)
+        if extra_checks is not None:
+            return "VALIDATION PASSED: file is valid markdown and math."
+        return "VALIDATION PASSED: file is valid markdown."
+
+    return validate_markdown_tool
+
+
+def _workspace_backend(workspace: Path):
+    """Mount a real directory into the agent's virtual filesystem.
+
+    Returns ``(backend, resolve)``:
+
+    * ``backend`` — a ``CompositeBackend`` that routes ``/workspace/``
+      to a ``FilesystemBackend`` rooted at ``workspace``
+      (``virtual_mode=True`` so ``..``/``~``/absolute escapes are
+      blocked), while agent-internal data (offloaded tool results,
+      conversation history) stays in the ephemeral default
+      ``StateBackend`` instead of leaking onto disk.
+    * ``resolve`` — maps the same virtual paths onto the real disk;
+      hand it to ``_make_validate_markdown_tool`` so the custom
+      validator sees the same namespace as the file tools.
+
+    deepagents' default backend (when ``backend=`` is omitted) is an
+    empty in-memory ``StateBackend``: the built-in file tools would
+    then never see (or change) any real file.
+    """
+    backend = CompositeBackend(
+        default=StateBackend(),
+        routes={WORKSPACE_MOUNT + "/": FilesystemBackend(
+            root_dir=str(workspace), virtual_mode=True)},
+    )
+
+    def resolve(file_path: str) -> Path:
+        rel = file_path
+        if rel.startswith(WORKSPACE_MOUNT + "/"):
+            rel = rel[len(WORKSPACE_MOUNT) + 1:]
+        return workspace / rel.lstrip("/")
+
+    return backend, resolve
+
+
+def create_review_agent(llm, system_prompt: str, extra_checks=None,
+                        workspace: str | Path | None = None):
+    """Create a DeepAgents reviewer with file tools + validate_markdown.
+
+    ``workspace`` (strongly recommended) is the real directory that
+    contains the file(s) to review; it is mounted at ``/workspace``
+    inside the agent's virtual filesystem.  Without it, deepagents'
+    built-in file tools (read_file, edit_file, ls, glob, grep) run on
+    an empty in-memory ``StateBackend`` and cannot see any real file,
+    so the agent gets validation errors it is unable to fix.  With
+    the mount, every tool -- including ``validate_markdown`` -- shares
+    one namespace, and the task text must address files as
+    ``/workspace/<path relative to workspace>``.
+
+    ``extra_checks`` is an optional callable ``text -> list[str]``.
+    When given, the ``validate_markdown`` tool runs it after the base
+    markdown validation, so the agent also sees (and can fix)
+    problems from additional deterministic checks — e.g. a KaTeX
+    compile check.  When omitted, behaviour is exactly the base
+    markdown-only validation.
     """
     review_model = ChatOpenAI(
         model=llm.model,
@@ -275,41 +370,25 @@ def create_review_agent(llm, system_prompt: str, extra_checks=None):
         use_responses_api=False,
     )
 
-    if extra_checks is None:
-        tools = [validate_markdown]
+    if workspace is None:
+        backend = None
+        resolve = lambda file_path: Path(file_path)  # noqa: E731
     else:
-
-        @tool("validate_markdown")
-        def validate_markdown_plus(file_path: str) -> str:
-            """Validate markdown syntax and math (KaTeX) in a file.
-
-            Runs the Python markdown parser plus extra deterministic
-            checks (e.g. KaTeX compilation of $...$ / $$...$$ math).
-            Returns the full validation result (errors or success).
-            """
-            try:
-                text = Path(file_path).read_text(encoding="utf-8")
-            except Exception as exc:
-                return f"ERROR reading file: {exc}"
-            errors = _validate_markdown_text(text) + list(extra_checks(text))
-            if errors:
-                return "VALIDATION ERRORS:\n" + "\n".join(errors)
-            return "VALIDATION PASSED: file is valid markdown and math."
-
-        tools = [validate_markdown_plus]
+        backend, resolve = _workspace_backend(Path(workspace).resolve())
 
     agent = create_deep_agent(
         model=review_model,
-        tools=tools,
+        tools=[_make_validate_markdown_tool(resolve, extra_checks)],
         system_prompt=system_prompt,
+        backend=backend,
     )
     return agent
 
 
 def review_and_fix_md(file_path: str, llm, max_iterations: int = 10) -> str:
     """Agentic review loop: validate markdown, fix errors until clean."""
-    abs_path = str(Path(file_path).resolve())
-    file_name = Path(abs_path).name
+    abs_path = Path(file_path).resolve()
+    file_name = abs_path.name
 
     print(f"\n=== Agentic Markdown Review ({file_name}) ===")
 
@@ -345,10 +424,12 @@ def review_and_fix_md(file_path: str, llm, max_iterations: int = 10) -> str:
             "of a PDF-to-Markdown conversion pipeline. Every conversion artifact "
             "must be cleaned."
         ),
+        workspace=abs_path.parent,
     )
 
     task_desc = (
-        f"Review and fix markdown syntax in the file '{abs_path}'.\n\n"
+        f"Review and fix markdown syntax in the file "
+        f"'{WORKSPACE_MOUNT}/{file_name}'.\n\n"
         "Use your validate_markdown tool to check the file, then read_file to see "
         "the content, and edit_file to fix any errors. Re-validate after each fix "
         "cycle. Continue until validate_markdown returns 'VALIDATION PASSED' or you "

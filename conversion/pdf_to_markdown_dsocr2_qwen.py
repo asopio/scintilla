@@ -83,6 +83,7 @@ from langchain_core.messages import HumanMessage
 
 import dsocr2_postprocess
 from pdf_to_markdown_agentic import (
+    WORKSPACE_MOUNT,
     _validate_markdown_text,
     create_review_agent,
     get_pdf_page_count,
@@ -208,7 +209,8 @@ REVIEW_SYSTEM_PROMPT = (
     "You have tools: read_file, edit_file, validate_markdown (a Python "
     "markdown parser check that also compiles every $...$ / $$...$$ "
     "formula with KaTeX and reports any parse error). The figure "
-    "manifest JSON path is given in the task.\n\n"
+    "manifest JSON path is given in the task. All file paths are "
+    "relative to your /workspace directory.\n\n"
     "Workflow:\n"
     "1. read_file the target file.\n"
     "2. Fix each item in the deterministic problem list given in the "
@@ -1405,8 +1407,21 @@ def review_chunk(
     call and tool call, via the LangChain callback API) is additionally
     written to that file as a JSONL trace.
     """
-    abs_path = str(chunk_path.resolve())
+    abs_path = Path(chunk_path).resolve()
     a, b = pages[0], pages[-1]
+    # Mount the real directory that holds both the chunk and the figure
+    # manifest (the document outdir) at /workspace inside the agent's
+    # virtual filesystem.  Without this, the built-in file tools run
+    # on deepagents' default empty in-memory StateBackend and cannot
+    # see (or change) the target file on disk, while validate_markdown
+    # -- a plain Python tool -- reads the real path: the agent would
+    # get errors it is unable to fix.
+    manifest_abs = Path(manifest_path).resolve()
+    workspace = Path(os.path.commonpath([str(abs_path), str(manifest_abs)]))
+    if not workspace.is_dir():
+        workspace = abs_path.parent
+    rel_chunk = abs_path.relative_to(workspace).as_posix()
+    rel_manifest = manifest_abs.relative_to(workspace).as_posix()
     agent = None
     tracer = ReviewTraceHandler(trace_path) if trace_path is not None else None
     invoke_config = ({"callbacks": [tracer]} if tracer is not None else None)
@@ -1427,12 +1442,15 @@ def review_chunk(
                       "problems": problems[:50]}
             if agent is None:
                 agent = create_review_agent(llm, REVIEW_SYSTEM_PROMPT,
-                                            extra_checks=check_katex)
+                                            extra_checks=check_katex,
+                                            workspace=workspace)
             task = (
-                f"Review and fix markdown syntax in the file '{abs_path}'.\n"
+                f"Review and fix markdown syntax in the file "
+                f"'{WORKSPACE_MOUNT}/{rel_chunk}'.\n"
                 f"This file is a page-range chunk (slides {a}..{b}) of an "
                 "OCR'd scientific document.\n"
-                f"Figure manifest for the whole document: '{manifest_path}' "
+                f"Figure manifest for the whole document: "
+                f"'{WORKSPACE_MOUNT}/{rel_manifest}' "
                 '(JSON list of {"page": N, "file": "figures/..."}; you may '
                 "read_file it).\n\n"
                 "Deterministic validation currently reports:\n"
