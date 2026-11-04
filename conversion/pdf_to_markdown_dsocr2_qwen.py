@@ -1031,6 +1031,47 @@ def _katex_transform(text: str) -> list[tuple[str, bool]]:
     return spans
 
 
+# markdown_katex's tex2html() runs _cleanup_cache_dir() in a `finally`
+# block on *every* formula render: a full iterdir()+stat() scan of the
+# shared /tmp/mdkatex cache.  With thousands of entries and ~17
+# concurrent review threads each validating formula-heavy chunks, that
+# scan -- not the KaTeX compile -- dominated validate_markdown: one
+# 3,400-formula chunk measured 372 s in isolation and 13,000+ s in a
+# live run.  The cache has a 24 h TTL and /tmp is large, so the real
+# cleanup is safe to run at most once per hour.
+_katex_cleanup_state = {
+    "installed": False,
+    "real": None,
+    "last": 0.0,
+    "interval_s": 3600.0,
+    "lock": threading.Lock(),
+}
+
+
+def _throttled_katex_cleanup() -> None:
+    state = _katex_cleanup_state
+    with state["lock"]:
+        now = time.time()
+        if now - state["last"] < state["interval_s"]:
+            return
+        state["last"] = now
+    state["real"]()
+
+
+def _install_throttled_katex_cleanup(wrapper) -> None:
+    """Replace markdown_katex's per-call cache cleanup with a version
+    that runs at most once per hour (see ``_katex_cleanup_state``)."""
+    state = _katex_cleanup_state
+    if state["installed"]:
+        return
+    with state["lock"]:
+        if state["installed"]:
+            return
+        state["real"] = wrapper._cleanup_cache_dir
+        wrapper._cleanup_cache_dir = _throttled_katex_cleanup
+        state["installed"] = True
+
+
 def check_katex(text: str) -> list[str]:
     """Compile every math span with KaTeX and return the failures."""
     if not _ensure_katex_bin():
@@ -1038,6 +1079,7 @@ def check_katex(text: str) -> list[str]:
               "skipping the KaTeX compile check", file=sys.stderr)
         return []
     from markdown_katex import wrapper
+    _install_throttled_katex_cleanup(wrapper)
     problems: list[str] = []
     for tex, display in _katex_transform(text):
         opts = {"display-mode": True} if display else {}

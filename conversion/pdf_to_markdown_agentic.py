@@ -201,6 +201,25 @@ def summarize_figure_description(description: str) -> str:
 # Markdown validation
 # ---------------------------------------------------------------------------
 
+def _unclosed_html_tag_pos(block: str) -> int:
+    """Return the offset of an unclosed HTML tag start inside a comment
+    block, or -1 when there is none.
+
+    A tag start is ``<`` followed by an ASCII letter (HTML tag names
+    begin with a letter, so math inequalities like ``|η|<2.5`` or
+    ``|Δφ| < 2`` inside figure descriptions do not count); it is
+    unclosed when no ``>`` appears before the next ``<`` or the end
+    of the block.
+    """
+    for m in re.finditer(r"<[a-zA-Z]", block):
+        rest = block[m.end():]
+        close = rest.find(">")
+        nxt = rest.find("<")
+        if close < 0 or (0 <= nxt < close):
+            return m.start()
+    return -1
+
+
 def _validate_markdown_text(text: str) -> list[str]:
     """Validate markdown syntax by attempting to convert it to HTML.
 
@@ -229,11 +248,15 @@ def _validate_markdown_text(text: str) -> list[str]:
         block_stripped = block.strip()
         if block_stripped.startswith("Figure:") or block_stripped.startswith("Table:"):
             continue
-        if not re.search(r"<[^/>]", block_stripped):
+        pos = _unclosed_html_tag_pos(block_stripped)
+        if pos < 0:
             continue
+        lo = max(0, pos - 40)
+        hi = min(len(block_stripped), pos + 60)
         errors.append(
-            f"Unclosed HTML tag detected (comment block {idx + 1}): "
-            f"{block_stripped[:200]}"
+            f"Unclosed HTML tag detected (comment block {idx + 1}, "
+            f"tag starts at char {pos}): "
+            f"{block_stripped[lo:hi]!r}"
         )
 
     return errors
