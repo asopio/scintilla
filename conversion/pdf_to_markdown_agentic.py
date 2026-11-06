@@ -16,8 +16,9 @@ from typing import Callable
 
 import markdown
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain.agents.middleware import AgentMiddleware
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
@@ -342,6 +343,65 @@ def _workspace_backend(workspace: Path):
     return backend, resolve
 
 
+class _NoSubagentMiddleware(AgentMiddleware):
+    """Remove subagent delegation from the review agent's model calls.
+
+    deepagents auto-adds a general-purpose subagent exposed through a
+    ``task`` tool, and appends a "subagent spawner" section to the
+    system prompt.  The review loop is a short, single-file iteration
+    and delegation adds no capability — subagents share the same
+    ``/workspace`` mount and the same tools.  In production traces
+    the model instead spawned read-only "debug" subagents that
+    wandered for up to 3.4 h per chunk (e.g. 2021-03/2759256: three
+    concurrent task calls, 7.5 h total, chunk ended in
+    ``agent_error``).
+
+    This is local to the agent (unlike a ``HarnessProfile`` registry
+    entry, which is global process state) and works on any deepagents
+    version that exposes the tool as ``task``: it drops the tool from
+    the model request and removes the appended prompt section.
+    ``write_todos`` and the file tools are untouched.
+    """
+
+    @staticmethod
+    def _strip_task_prompt(system_message):
+        if system_message is None:
+            return system_message
+        kept, changed = [], False
+        for b in system_message.content_blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                text = str(b.get("text", ""))
+                if "(subagent spawner)" in text \
+                        or text.lstrip().startswith("## `task`"):
+                    changed = True
+                    continue
+            kept.append(b)
+        if not changed:
+            return system_message
+        return SystemMessage(content_blocks=kept)
+
+    def _filter(self, request):
+        tools = request.tools or []
+        kept_tools = [
+            t for t in tools
+            if (t.get("name") if isinstance(t, dict)
+                else getattr(t, "name", None)) != "task"
+        ]
+        overrides = {}
+        if len(kept_tools) != len(tools):
+            overrides["tools"] = kept_tools
+        sm = self._strip_task_prompt(request.system_message)
+        if sm is not request.system_message:
+            overrides["system_message"] = sm
+        return request.override(**overrides) if overrides else request
+
+    def wrap_model_call(self, request, handler):
+        return handler(self._filter(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._filter(request))
+
+
 def create_review_agent(llm, system_prompt: str, extra_checks=None,
                         workspace: str | Path | None = None):
     """Create a DeepAgents reviewer with file tools + validate_markdown.
@@ -362,6 +422,10 @@ def create_review_agent(llm, system_prompt: str, extra_checks=None,
     problems from additional deterministic checks — e.g. a KaTeX
     compile check.  When omitted, behaviour is exactly the base
     markdown-only validation.
+
+    Subagent delegation is disabled (``_NoSubagentMiddleware``):
+    the review is a single-file iteration and the ``task`` tool only
+    cost time and tokens in production (see that class's docstring).
     """
     review_model = ChatOpenAI(
         model=llm.model,
@@ -381,6 +445,11 @@ def create_review_agent(llm, system_prompt: str, extra_checks=None,
         tools=[_make_validate_markdown_tool(resolve, extra_checks)],
         system_prompt=system_prompt,
         backend=backend,
+        # deepagents has no per-agent flag to suppress the auto-added
+        # general-purpose subagent in this version (its middleware is
+        # "required scaffolding"), so strip the task tool from the model
+        # request instead — see _NoSubagentMiddleware.
+        middleware=[_NoSubagentMiddleware()],
     )
     return agent
 
