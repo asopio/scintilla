@@ -1235,14 +1235,66 @@ def review_markdown_file(file_path: str, model: str, api_key: str, base_url: str
     presentation file.  Raises on unrecoverable agent errors.
     """
     from langchain_openai import ChatOpenAI
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_core.tools import tool
+    from langchain.agents.middleware import AgentMiddleware
     from deepagents import create_deep_agent
     from deepagents.backends import (
         CompositeBackend,
         FilesystemBackend,
         StateBackend,
     )
+
+    class _NoSubagentMiddleware(AgentMiddleware):
+        """Remove subagent delegation from the review agent's model calls.
+
+        deepagents auto-adds a general-purpose subagent exposed through
+        a ``task`` tool and a "subagent spawner" system-prompt section.
+        The review is a single-file iteration, so delegation adds no
+        capability — production traces show the model spawning
+        read-only "debug" subagents that cost hours per chunk.  In the
+        installed deepagents version the subagent middleware is
+        "required scaffolding" (cannot be excluded via profile), so the
+        task tool is stripped from the model request instead.
+        """
+
+        @staticmethod
+        def _strip_task_prompt(system_message):
+            if system_message is None:
+                return system_message
+            kept, changed = [], False
+            for b in system_message.content_blocks:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    text = str(b.get("text", ""))
+                    if "(subagent spawner)" in text \
+                            or text.lstrip().startswith("## `task`"):
+                        changed = True
+                        continue
+                kept.append(b)
+            if not changed:
+                return system_message
+            return SystemMessage(content_blocks=kept)
+
+        def _filter(self, request):
+            tools = request.tools or []
+            kept_tools = [
+                t for t in tools
+                if (t.get("name") if isinstance(t, dict)
+                    else getattr(t, "name", None)) != "task"
+            ]
+            overrides = {}
+            if len(kept_tools) != len(tools):
+                overrides["tools"] = kept_tools
+            sm = self._strip_task_prompt(request.system_message)
+            if sm is not request.system_message:
+                overrides["system_message"] = sm
+            return request.override(**overrides) if overrides else request
+
+        def wrap_model_call(self, request, handler):
+            return handler(self._filter(request))
+
+        async def awrap_model_call(self, request, handler):
+            return await handler(self._filter(request))
 
     abs_path = Path(file_path).resolve()
     file_name = abs_path.name
@@ -1285,6 +1337,7 @@ def review_markdown_file(file_path: str, model: str, api_key: str, base_url: str
         tools=[validate_markdown],
         system_prompt=REVIEW_SYSTEM_PROMPT,
         backend=backend,
+        middleware=[_NoSubagentMiddleware()],
     )
 
     task_desc = (
